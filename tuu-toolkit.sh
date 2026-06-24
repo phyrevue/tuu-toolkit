@@ -1,755 +1,1342 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-# TUU Toolkit 一键部署脚本
+# TUU Toolkit 一键管理脚本
 # 项目地址: https://github.com/phyrevue/tuu-toolkit
-# Gost官方: https://github.com/go-gost/gost
-# Version: 2.0.0
-# 
-# 使用方法:
-# bash <(curl -fsSL https://raw.githubusercontent.com/phyrevue/tuu-toolkit/main/tuu-toolkit.sh)
-# 
-# 或带参数:
-# PORT=8080 USE_AUTH=true USERNAME=admin PASSWORD=secret bash <(curl -fsSL https://raw.githubusercontent.com/phyrevue/tuu-toolkit/main/tuu-toolkit.sh)
+# 支持: Debian/Ubuntu, Alpine, CentOS/RHEL/Rocky/Alma
+# Version: 3.0.0
 
-set -e
+set -o pipefail
 
-# 颜色定义
+TOOL_VERSION="3.0.0"
+REPO_URL="https://github.com/phyrevue/tuu-toolkit"
+RAW_URL="https://raw.githubusercontent.com/phyrevue/tuu-toolkit/main/tuu-toolkit.sh"
+LOG_FILE="/var/log/tuu-toolkit.log"
+
+GOST_DIR="/etc/gost"
+GOST_CONFIG="$GOST_DIR/config.yaml"
+GOST_BIN="/usr/local/bin/gost"
+GOST_SERVICE="gost"
+
+SS_DIR="/etc/ss-rust"
+SS_CONFIG="$SS_DIR/config.json"
+SS_BIN="/usr/local/bin/ssserver"
+SS_VERSION_FILE="$SS_DIR/version"
+SS_SERVICE="ss-rust"
+
+REALM_DIR="/root/realm"
+REALM_CONFIG="$REALM_DIR/config.toml"
+REALM_BIN="$REALM_DIR/realm"
+REALM_SERVICE="realm"
+
 RED='\033[0;31m'
 GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
+YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m'
 
-# 日志函数
-log_info() {
-    echo -e "${BLUE}[INFO]${NC} $1"
+OS_ID=""
+OS_NAME=""
+OS_FAMILY=""
+PKG_MANAGER=""
+SERVICE_MANAGER=""
+LIBC_KIND=""
+ARCH_RAW=""
+
+log_info() { echo -e "${BLUE}[INFO]${NC} $*"; }
+log_success() { echo -e "${GREEN}[SUCCESS]${NC} $*"; }
+log_warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
+log_error() { echo -e "${RED}[ERROR]${NC} $*" >&2; }
+
+clear_screen() {
+    if [[ -t 1 && -n "${TERM:-}" ]] && command -v clear >/dev/null 2>&1; then
+        command clear
+    else
+        printf '\n'
+    fi
 }
 
-log_success() {
-    echo -e "${GREEN}[SUCCESS]${NC} $1"
+write_log() {
+    mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG_FILE" 2>/dev/null || true
 }
 
-log_warn() {
-    echo -e "${YELLOW}[WARN]${NC} $1"
+pause() {
+    if [[ -t 0 ]]; then
+        read -r -p "按回车键继续..."
+    fi
 }
 
-log_error() {
-    echo -e "${RED}[ERROR]${NC} $1"
+confirm() {
+    local prompt="${1:-确认继续?}"
+    local answer
+    read -r -p "$prompt [y/N]: " answer
+    [[ "$answer" =~ ^[Yy]$ ]]
 }
 
-# 检查是否为 root 用户
-check_root() {
-    if [[ $EUID -ne 0 ]]; then
+require_root() {
+    if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
         log_error "此脚本需要 root 权限运行"
-        log_info "请使用: sudo bash $0"
         exit 1
     fi
 }
 
-# 检测系统
-detect_system() {
-    if [[ -f /etc/redhat-release ]]; then
-        OS="centos"
-        PACKAGE_MANAGER="yum"
-    elif cat /etc/issue | grep -q -E -i "debian|raspbian"; then
-        OS="debian"
-        PACKAGE_MANAGER="apt-get"
-    elif cat /etc/issue | grep -q -E -i "ubuntu"; then
-        OS="ubuntu"
-        PACKAGE_MANAGER="apt-get"
-    elif cat /etc/issue | grep -q -E -i "centos|red hat|redhat"; then
-        OS="centos"
-        PACKAGE_MANAGER="yum"
-    elif cat /proc/version | grep -q -E -i "debian|raspbian"; then
-        OS="debian"
-        PACKAGE_MANAGER="apt-get"
-    elif cat /proc/version | grep -q -E -i "ubuntu"; then
-        OS="ubuntu"
-        PACKAGE_MANAGER="apt-get"
-    elif cat /proc/version | grep -q -E -i "centos|red hat|redhat"; then
-        OS="centos"
-        PACKAGE_MANAGER="yum"
-    else
-        log_error "不支持的操作系统"
+need_bash() {
+    if [[ -z "${BASH_VERSION:-}" ]]; then
+        echo "请使用 bash 运行本脚本。Alpine 可先执行: apk add --no-cache bash"
         exit 1
     fi
-    
-    log_info "检测到系统: $OS"
 }
 
-# 获取最新版本的 Gost
-get_latest_version() {
-    log_info "获取 Gost 最新版本..."
-    
-    # 使用 GitHub API 获取最新版本
-    if command -v curl &> /dev/null; then
-        LATEST_VERSION=$(curl -s https://api.github.com/repos/go-gost/gost/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
-    elif command -v wget &> /dev/null; then
-        LATEST_VERSION=$(wget -qO- https://api.github.com/repos/go-gost/gost/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+detect_os() {
+    OS_ID=""
+    OS_NAME=""
+    OS_FAMILY=""
+    PKG_MANAGER=""
+
+    if [[ -r /etc/os-release ]]; then
+        # shellcheck disable=SC1091
+        . /etc/os-release
+        OS_ID="${ID:-}"
+        OS_NAME="${PRETTY_NAME:-${NAME:-unknown}}"
+        local like="${ID_LIKE:-}"
+        case "$OS_ID $like" in
+            *alpine*)
+                OS_FAMILY="alpine"
+                PKG_MANAGER="apk"
+                ;;
+            *debian*|*ubuntu*)
+                OS_FAMILY="debian"
+                PKG_MANAGER="apt-get"
+                ;;
+            *centos*|*rhel*|*fedora*|*rocky*|*almalinux*)
+                OS_FAMILY="centos"
+                if command -v dnf >/dev/null 2>&1; then
+                    PKG_MANAGER="dnf"
+                else
+                    PKG_MANAGER="yum"
+                fi
+                ;;
+        esac
+    fi
+
+    if [[ -z "$OS_FAMILY" ]]; then
+        if command -v apk >/dev/null 2>&1; then
+            OS_FAMILY="alpine"
+            PKG_MANAGER="apk"
+            OS_NAME="Alpine Linux"
+        elif command -v apt-get >/dev/null 2>&1; then
+            OS_FAMILY="debian"
+            PKG_MANAGER="apt-get"
+            OS_NAME="Debian/Ubuntu"
+        elif command -v dnf >/dev/null 2>&1; then
+            OS_FAMILY="centos"
+            PKG_MANAGER="dnf"
+            OS_NAME="CentOS/RHEL compatible"
+        elif command -v yum >/dev/null 2>&1; then
+            OS_FAMILY="centos"
+            PKG_MANAGER="yum"
+            OS_NAME="CentOS/RHEL compatible"
+        else
+            log_error "不支持的操作系统，当前仅支持 Debian/Ubuntu、Alpine、CentOS/RHEL/Rocky/Alma"
+            exit 1
+        fi
+    fi
+}
+
+detect_service_manager() {
+    if [[ "$OS_FAMILY" == "alpine" ]]; then
+        SERVICE_MANAGER="openrc"
+    elif [[ "$OS_FAMILY" == "debian" || "$OS_FAMILY" == "centos" ]]; then
+        SERVICE_MANAGER="systemd"
+    elif command -v rc-service >/dev/null 2>&1; then
+        SERVICE_MANAGER="openrc"
+    elif command -v systemctl >/dev/null 2>&1; then
+        SERVICE_MANAGER="systemd"
     else
-        log_warn "无法自动获取最新版本，使用默认版本 v3.2.3"
-        LATEST_VERSION="v3.2.3"
+        SERVICE_MANAGER="none"
     fi
-    
-    # 验证版本格式
-    if [[ ! "$LATEST_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-        log_warn "获取版本失败，使用默认版本 v3.2.3"
-        LATEST_VERSION="v3.2.3"
-    fi
-    
-    GOST_VERSION="$LATEST_VERSION"
-    GOST_VERSION_NUM="${GOST_VERSION#v}"  # 去掉 v 前缀
-    
-    log_info "将安装 Gost 版本: $GOST_VERSION"
 }
 
-# 检测架构并设置下载链接
-set_download_url() {
-    log_info "检测系统架构..."
-    
-    ARCH=$(uname -m)
-    case $ARCH in
-        x86_64)
-            ARCH_NAME="amd64"
-            DOWNLOAD_URL="https://github.com/go-gost/gost/releases/download/${GOST_VERSION}/gost_${GOST_VERSION_NUM}_linux_amd64.tar.gz"
+detect_libc() {
+    LIBC_KIND="gnu"
+    if [[ "$OS_FAMILY" == "alpine" ]]; then
+        LIBC_KIND="musl"
+    elif ldd --version 2>&1 | grep -qi musl; then
+        LIBC_KIND="musl"
+    fi
+}
+
+detect_arch_raw() {
+    ARCH_RAW="$(uname -m)"
+}
+
+init_context() {
+    detect_os
+    detect_service_manager
+    detect_libc
+    detect_arch_raw
+}
+
+print_system_info() {
+    init_context
+    echo "TUU Toolkit: $TOOL_VERSION"
+    echo "系统: ${OS_NAME:-unknown}"
+    echo "系统族: $OS_FAMILY"
+    echo "包管理器: $PKG_MANAGER"
+    echo "服务管理: $SERVICE_MANAGER"
+    echo "libc: $LIBC_KIND"
+    echo "架构: $ARCH_RAW"
+}
+
+map_packages() {
+    local mapped=()
+    local pkg
+    for pkg in "$@"; do
+        case "$OS_FAMILY:$pkg" in
+            debian:xz) mapped+=("xz-utils") ;;
+            debian:procps) mapped+=("procps") ;;
+            debian:cron) mapped+=("cron") ;;
+            alpine:xz) mapped+=("xz") ;;
+            alpine:procps) mapped+=("procps") ;;
+            alpine:cron) mapped+=("dcron") ;;
+            centos:xz) mapped+=("xz") ;;
+            centos:procps) mapped+=("procps-ng") ;;
+            centos:cron) mapped+=("cronie") ;;
+            *) mapped+=("$pkg") ;;
+        esac
+    done
+    printf '%s\n' "${mapped[@]}"
+}
+
+install_packages() {
+    require_root
+    init_context
+    local requested=("$@")
+    local packages=()
+    local pkg
+    while IFS= read -r pkg; do
+        [[ -n "$pkg" ]] && packages+=("$pkg")
+    done < <(map_packages "${requested[@]}")
+
+    if [[ ${#packages[@]} -eq 0 ]]; then
+        return 0
+    fi
+
+    log_info "安装依赖: ${packages[*]}"
+    case "$PKG_MANAGER" in
+        apt-get)
+            apt-get update
+            DEBIAN_FRONTEND=noninteractive apt-get install -y "${packages[@]}"
             ;;
-        aarch64)
-            ARCH_NAME="arm64"
-            DOWNLOAD_URL="https://github.com/go-gost/gost/releases/download/${GOST_VERSION}/gost_${GOST_VERSION_NUM}_linux_arm64.tar.gz"
+        apk)
+            apk update
+            apk add --no-cache "${packages[@]}"
             ;;
-        armv7l)
-            ARCH_NAME="armv7"
-            DOWNLOAD_URL="https://github.com/go-gost/gost/releases/download/${GOST_VERSION}/gost_${GOST_VERSION_NUM}_linux_armv7.tar.gz"
+        dnf)
+            dnf install -y --allowerasing "${packages[@]}"
+            ;;
+        yum)
+            yum install -y "${packages[@]}"
             ;;
         *)
-            log_error "不支持的架构: $ARCH"
-            exit 1
+            log_error "找不到可用包管理器"
+            return 1
             ;;
     esac
-    
-    log_info "架构: $ARCH ($ARCH_NAME)"
 }
 
-# 安装依赖
-install_dependencies() {
-    log_info "安装必要的依赖..."
-    
-    if [[ "$PACKAGE_MANAGER" == "apt-get" ]]; then
-        # 尝试修复损坏的包
-        log_info "检查包管理器状态..."
-        dpkg --configure -a 2>/dev/null || true
-        
-        # 清理包缓存
-        apt-get clean
-        
-        # 尝试更新，忽略特定错误
-        log_info "更新包列表..."
-        apt-get update 2>&1 | while read line; do
-            if [[ ! "$line" =~ "bullseye-backports" ]]; then
-                echo "$line"
-            fi
-        done || true
-        
-        # 安装包，使用 --fix-missing 选项
-        log_info "安装必要的包..."
-        DEBIAN_FRONTEND=noninteractive apt-get install -y --fix-missing curl wget tar 2>&1 | \
-            grep -v "bullseye-backports" || {
-            log_warn "标准安装失败，尝试强制安装..."
-            # 尝试单独安装每个包
-            for pkg in curl wget tar; do
-                if ! command -v $pkg &> /dev/null; then
-                    DEBIAN_FRONTEND=noninteractive apt-get install -y --fix-missing $pkg || \
-                        log_warn "无法安装 $pkg，但继续执行..."
-                fi
-            done
-        }
-    elif [[ "$PACKAGE_MANAGER" == "yum" ]]; then
-        yum install -y curl wget tar
-    fi
-    
-    # 检查关键命令
-    local missing_cmds=()
-    for cmd in wget curl; do
-        if ! command -v $cmd &> /dev/null; then
-            missing_cmds+=($cmd)
-        fi
-    done
-    
-    if [ ${#missing_cmds[@]} -eq 2 ]; then
-        log_error "缺少必要的下载工具: wget 和 curl"
-        log_info "请手动安装: apt-get install -y wget curl"
-        exit 1
-    elif [ ${#missing_cmds[@]} -eq 1 ]; then
-        log_warn "缺少 ${missing_cmds[0]}，将使用其他下载工具"
-    fi
-    
-    log_success "依赖检查完成"
+install_core_dependencies() {
+    install_packages bash curl wget tar gzip ca-certificates sed grep procps openssl
 }
 
-# 下载和安装 Gost
-install_gost() {
-    log_info "开始安装 Gost $GOST_VERSION ..."
-    
-    # 检查是否已安装
-    if command -v gost &> /dev/null; then
-        INSTALLED_VERSION=$(gost -V 2>&1 | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' || echo "unknown")
-        if [[ "$INSTALLED_VERSION" == "$GOST_VERSION" ]]; then
-            log_info "Gost $GOST_VERSION 已经安装"
-            return
-        else
-            log_info "当前版本: $INSTALLED_VERSION，将更新到: $GOST_VERSION"
-        fi
-    fi
-    
-    # 创建临时目录
-    TEMP_DIR="/tmp/gost-install-$(date +%s)"
-    mkdir -p $TEMP_DIR
-    cd $TEMP_DIR
-    
-    # 下载文件
-    log_info "下载地址: $DOWNLOAD_URL"
-    
-    if command -v wget &> /dev/null; then
-        wget --no-check-certificate -O gost.tar.gz "$DOWNLOAD_URL"
-    elif command -v curl &> /dev/null; then
-        curl -L -o gost.tar.gz "$DOWNLOAD_URL"
-    else
-        log_error "需要安装 wget 或 curl"
-        exit 1
-    fi
-    
-    if [[ $? -ne 0 ]]; then
-        log_error "下载失败"
-        exit 1
-    fi
-    
-    # 解压和安装
-    log_info "解压和安装..."
-    tar -xzf gost.tar.gz
-    
-    if [[ ! -f gost ]]; then
-        log_error "解压失败,找不到 gost 可执行文件"
-        exit 1
-    fi
-    
-    chmod +x gost
-    
-    # 停止服务（如果正在运行）
-    if systemctl is-active --quiet gost; then
-        systemctl stop gost
-    fi
-    
-    cp gost /usr/local/bin/
-    
-    # 验证安装
-    if /usr/local/bin/gost -V; then
-        log_success "Gost $GOST_VERSION 安装成功"
-    else
-        log_error "Gost 安装失败"
-        exit 1
-    fi
-    
-    # 清理临时文件
-    cd /
-    rm -rf $TEMP_DIR
+install_archive_dependencies() {
+    install_packages bash curl wget tar gzip ca-certificates sed grep procps openssl xz
 }
 
-# 交互式配置
-configure_interactive() {
-    log_info "开始配置 SOCKS5 代理..."
-    
-    # 端口配置
-    while true; do
-        read -p "请输入 SOCKS5 端口 [默认: 1080]: " PORT
-        PORT=${PORT:-1080}
-        
-        # 验证端口
-        if ! [[ "$PORT" =~ ^[0-9]+$ ]] || [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
-            log_error "端口必须是1-65535之间的数字"
-            continue
+ensure_service_dependencies() {
+    init_context
+    if [[ "$SERVICE_MANAGER" == "openrc" ]]; then
+        if ! command -v rc-service >/dev/null 2>&1 || ! command -v rc-update >/dev/null 2>&1; then
+            install_packages openrc
         fi
-        
-        if [ "$PORT" -lt 1024 ]; then
-            log_warn "端口 $PORT 是特权端口，需要root权限"
-        fi
-        
-        # 检查端口是否被占用
-        if netstat -tlnp 2>/dev/null | grep -q ":$PORT "; then
-            log_warn "端口 $PORT 已被占用"
-            read -p "是否继续使用此端口? [y/N]: " CONTINUE
-            if [[ ! "$CONTINUE" =~ ^[Yy]$ ]]; then
-                continue
-            fi
-        fi
-        break
-    done
-    
-    # 绑定地址配置
-    read -p "请输入绑定地址 [默认: 0.0.0.0 - 监听所有接口]: " BIND_ADDR
-    BIND_ADDR=${BIND_ADDR:-0.0.0.0}
-    
-    # 认证配置
-    read -p "是否启用用户认证? [y/N]: " ENABLE_AUTH
-    if [[ "$ENABLE_AUTH" =~ ^[Yy]$ ]]; then
-        USE_AUTH="true"
-        
-        # 用户名
-        while true; do
-            read -p "请输入用户名: " USERNAME
-            if [[ -z "$USERNAME" ]]; then
-                log_warn "用户名不能为空"
-                continue
-            fi
-            break
-        done
-        
-        # 密码
-        while true; do
-            read -s -p "请输入密码: " PASSWORD
-            echo
-            if [[ -z "$PASSWORD" ]]; then
-                log_warn "密码不能为空"
-                continue
-            fi
-            
-            # 密码强度检查
-            if [[ ${#PASSWORD} -lt 8 ]]; then
-                log_warn "密码长度建议至少8位"
-                read -p "是否继续使用当前密码? [y/N]: " CONTINUE
-                if [[ ! "$CONTINUE" =~ ^[Yy]$ ]]; then
-                    continue
-                fi
-            fi
-            
-            # 确认密码
-            read -s -p "请再次输入密码: " PASSWORD_CONFIRM
-            echo
-            if [[ "$PASSWORD" != "$PASSWORD_CONFIRM" ]]; then
-                log_warn "两次输入的密码不一致"
-                continue
-            fi
-            break
-        done
-    else
-        USE_AUTH="false"
+        mkdir -p /etc/init.d
     fi
-    
-    # 日志级别配置
-    echo -e "\n日志级别选项："
-    echo "1) debug - 详细调试信息"
-    echo "2) info  - 一般信息"
-    echo "3) warn  - 警告信息（默认）"
-    echo "4) error - 仅错误信息"
-    read -p "请选择日志级别 [1-4, 默认: 3]: " LOG_CHOICE
-    
-    case ${LOG_CHOICE:-3} in
-        1) LOG_LEVEL="debug" ;;
-        2) LOG_LEVEL="info" ;;
-        3) LOG_LEVEL="warn" ;;
-        4) LOG_LEVEL="error" ;;
-        *) LOG_LEVEL="warn" ;;
+}
+
+download_file() {
+    local url="$1"
+    local output="$2"
+    if command -v curl >/dev/null 2>&1; then
+        curl -fL --connect-timeout 20 --retry 2 -o "$output" "$url"
+    elif command -v wget >/dev/null 2>&1; then
+        wget --no-check-certificate -O "$output" "$url"
+    else
+        log_error "缺少 curl 或 wget"
+        return 1
+    fi
+}
+
+get_latest_tag() {
+    local repo="$1"
+    local fallback="$2"
+    local tag=""
+    local json=""
+
+    if command -v curl >/dev/null 2>&1; then
+        json="$(curl -fsSL --connect-timeout 15 "https://api.github.com/repos/${repo}/releases/latest" 2>/dev/null || true)"
+    elif command -v wget >/dev/null 2>&1; then
+        json="$(wget -qO- "https://api.github.com/repos/${repo}/releases/latest" 2>/dev/null || true)"
+    fi
+
+    tag="$(printf '%s' "$json" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
+    if [[ -z "$tag" ]]; then
+        tag="$fallback"
+    fi
+    echo "$tag"
+}
+
+gost_arch() {
+    case "$ARCH_RAW" in
+        x86_64|amd64) echo "amd64" ;;
+        aarch64|arm64) echo "arm64" ;;
+        armv7l|armv7) echo "armv7" ;;
+        i386|i686) echo "386" ;;
+        *) echo "" ;;
     esac
 }
 
-# 生成配置文件
-generate_config() {
-    log_info "生成配置文件..."
-    
-    # 创建配置目录和日志目录
-    mkdir -p /etc/gost
-    mkdir -p /var/log/gost
-    
-    # 根据是否启用认证生成不同的配置
-    if [[ "$USE_AUTH" == "true" ]]; then
-        # 带认证的配置
-        cat > /etc/gost/config.yaml << EOF
-# Gost SOCKS5 代理配置文件 (带认证)
-# 版本: ${GOST_VERSION}
-# 生成时间: $(date)
-# 端口: ${PORT}
-# 认证: 启用 (用户名: ${USERNAME})
-
-services:
-- name: socks5-service
-  addr: "${BIND_ADDR}:${PORT}"
-  handler:
-    type: socks5
-    auth:
-      username: ${USERNAME}
-      password: ${PASSWORD}
-  listener:
-    type: tcp
-
-log:
-  level: ${LOG_LEVEL}
-  output: /var/log/gost/gost.log
-  rotation:
-    maxSize: 100
-    maxAge: 30
-    maxBackups: 5
-    compress: true
-EOF
-    else
-        # 无认证的配置
-        cat > /etc/gost/config.yaml << EOF
-# Gost SOCKS5 代理配置文件 (无认证)
-# 版本: ${GOST_VERSION}
-# 生成时间: $(date)
-# 端口: ${PORT}
-# 认证: 禁用
-
-services:
-- name: socks5-service
-  addr: "${BIND_ADDR}:${PORT}"
-  handler:
-    type: socks5
-  listener:
-    type: tcp
-
-log:
-  level: ${LOG_LEVEL}
-  output: /var/log/gost/gost.log
-  rotation:
-    maxSize: 100
-    maxAge: 30
-    maxBackups: 5
-    compress: true
-EOF
-    fi
-    
-    # 设置配置文件权限（保护密码安全）
-    chmod 600 /etc/gost/config.yaml
-    chown root:root /etc/gost/config.yaml
-    
-    log_success "配置文件已生成: /etc/gost/config.yaml"
+linux_rust_target() {
+    local libc="${1:-$LIBC_KIND}"
+    case "$ARCH_RAW" in
+        x86_64|amd64) echo "x86_64-unknown-linux-${libc}" ;;
+        aarch64|arm64) echo "aarch64-unknown-linux-${libc}" ;;
+        armv7l|armv7)
+            if [[ "$libc" == "musl" ]]; then
+                echo "armv7-unknown-linux-musleabihf"
+            else
+                echo "armv7-unknown-linux-gnueabihf"
+            fi
+            ;;
+        armv6l)
+            if [[ "$libc" == "musl" ]]; then
+                echo "arm-unknown-linux-musleabihf"
+            else
+                echo "arm-unknown-linux-gnueabihf"
+            fi
+            ;;
+        i386|i686)
+            if [[ "$libc" == "musl" ]]; then
+                echo "i686-unknown-linux-musl"
+            else
+                echo ""
+            fi
+            ;;
+        *) echo "" ;;
+    esac
 }
 
-# 创建 systemd 服务
-create_systemd_service() {
-    log_info "创建 systemd 服务..."
-    
-    cat > /etc/systemd/system/gost.service << EOF
+json_escape() {
+    printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+yaml_escape() {
+    printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+valid_port() {
+    [[ "$1" =~ ^[0-9]+$ ]] && (( "$1" >= 1 && "$1" <= 65535 ))
+}
+
+random_port() {
+    local port
+    port="$(od -An -N2 -tu2 /dev/urandom 2>/dev/null | tr -d ' ')"
+    port=$(( port % 55535 + 10000 ))
+    echo "$port"
+}
+
+random_password() {
+    local bytes="${1:-24}"
+    if command -v openssl >/dev/null 2>&1; then
+        openssl rand -base64 "$bytes"
+    elif command -v head >/dev/null 2>&1 && command -v base64 >/dev/null 2>&1; then
+        head -c "$bytes" /dev/urandom | base64
+    else
+        date +%s%N | sha256sum | awk '{print $1}'
+    fi
+}
+
+systemd_is_running() {
+    [[ -d /run/systemd/system ]] && command -v systemctl >/dev/null 2>&1
+}
+
+reload_service_manager() {
+    if [[ "$SERVICE_MANAGER" == "systemd" ]]; then
+        if systemd_is_running; then
+            systemctl daemon-reload || true
+        else
+            log_warn "systemd 未运行，已生成服务文件但跳过 daemon-reload"
+        fi
+    fi
+}
+
+enable_service() {
+    local service="$1"
+    if [[ "$SERVICE_MANAGER" == "systemd" ]]; then
+        if systemd_is_running; then
+            systemctl enable "$service" || true
+        else
+            log_warn "systemd 未运行，跳过 enable $service"
+        fi
+    elif [[ "$SERVICE_MANAGER" == "openrc" ]]; then
+        if command -v rc-update >/dev/null 2>&1; then
+            rc-update add "$service" default >/dev/null 2>&1 || true
+        fi
+    fi
+}
+
+service_action() {
+    local service="$1"
+    local action="$2"
+    if [[ "$SERVICE_MANAGER" == "systemd" ]]; then
+        if systemd_is_running; then
+            systemctl "$action" "$service"
+        else
+            log_warn "systemd 未运行，无法执行: systemctl $action $service"
+            return 1
+        fi
+    elif [[ "$SERVICE_MANAGER" == "openrc" ]]; then
+        if command -v rc-service >/dev/null 2>&1; then
+            rc-service "$service" "$action"
+        else
+            log_warn "OpenRC 不可用，无法执行: rc-service $service $action"
+            return 1
+        fi
+    else
+        log_warn "未知服务管理器，无法管理 $service"
+        return 1
+    fi
+}
+
+service_status_text() {
+    local service="$1"
+    if [[ "$SERVICE_MANAGER" == "systemd" ]]; then
+        if systemd_is_running && systemctl is-active --quiet "$service"; then
+            echo "运行中"
+        elif systemd_is_running; then
+            echo "未运行"
+        else
+            echo "systemd 未运行"
+        fi
+    elif [[ "$SERVICE_MANAGER" == "openrc" ]]; then
+        if command -v rc-service >/dev/null 2>&1 && rc-service "$service" status >/dev/null 2>&1; then
+            echo "运行中"
+        else
+            echo "未运行"
+        fi
+    else
+        echo "无法检测"
+    fi
+}
+
+open_firewall_port() {
+    local port="$1"
+    local proto="${2:-tcp}"
+
+    if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+        firewall-cmd --permanent --add-port="${port}/${proto}" >/dev/null 2>&1 || true
+        firewall-cmd --reload >/dev/null 2>&1 || true
+        log_success "firewalld 已放行 ${port}/${proto}"
+    elif command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+        ufw allow "${port}/${proto}" >/dev/null 2>&1 || true
+        log_success "ufw 已放行 ${port}/${proto}"
+    elif command -v iptables >/dev/null 2>&1; then
+        iptables -C INPUT -p "$proto" --dport "$port" -j ACCEPT >/dev/null 2>&1 || \
+            iptables -I INPUT -p "$proto" --dport "$port" -j ACCEPT >/dev/null 2>&1 || true
+        log_success "iptables 已尝试放行 ${port}/${proto}"
+    else
+        log_warn "未检测到可自动配置的防火墙，请手动放行 ${port}/${proto}"
+    fi
+}
+
+write_systemd_service() {
+    local path="/etc/systemd/system/$1.service"
+    local description="$2"
+    local exec_start="$3"
+    local read_write_paths="${4:-}"
+
+    mkdir -p /etc/systemd/system
+    cat > "$path" <<EOF
 [Unit]
-Description=Gost SOCKS5 Proxy Service
-Documentation=https://github.com/go-gost/gost
-After=network.target
+Description=$description
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
 User=root
-ExecStart=/usr/local/bin/gost -C /etc/gost/config.yaml
-Restart=always
-RestartSec=10
-StandardOutput=journal
-StandardError=journal
-SyslogIdentifier=gost
+ExecStart=$exec_start
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=1048576
+EOF
 
-# 安全设置
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=strict
-ProtectHome=true
-ReadWritePaths=/var/log/gost
+    if [[ -n "$read_write_paths" ]]; then
+        cat >> "$path" <<EOF
+ReadWritePaths=$read_write_paths
+EOF
+    fi
+
+    cat >> "$path" <<'EOF'
 
 [Install]
 WantedBy=multi-user.target
 EOF
-    
-    # 重新加载 systemd
-    systemctl daemon-reload
-    
-    # 启用服务
-    systemctl enable gost
-    
-    log_success "Systemd 服务已创建并启用"
 }
 
-# 创建管理脚本
-create_management_script() {
-    log_info "创建管理脚本..."
-    
-    cat > /usr/local/bin/tuu-toolkit << 'EOF'
-#!/bin/bash
+write_openrc_service() {
+    local path="/etc/init.d/$1"
+    local description="$2"
+    local command="$3"
+    local command_args="$4"
+    local output_log="${5:-/var/log/$1.log}"
+    local error_log="${6:-/var/log/$1.err}"
 
-# 颜色定义
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-BLUE='\033[0;34m'
-NC='\033[0m'
+    mkdir -p /etc/init.d
+    cat > "$path" <<EOF
+#!/sbin/openrc-run
 
-# 帮助信息
-show_help() {
-    echo "TUU Toolkit 管理工具"
-    echo ""
-    echo "用法: tuu-toolkit [命令]"
-    echo ""
-    echo "命令:"
-    echo "  start    - 启动服务"
-    echo "  stop     - 停止服务"
-    echo "  restart  - 重启服务"
-    echo "  status   - 查看状态"
-    echo "  logs     - 查看日志"
-    echo "  config   - 查看配置"
-    echo "  test     - 测试代理"
-    echo "  update   - 更新 Gost"
-    echo "  help     - 显示帮助"
+name="$1"
+description="$description"
+command="$command"
+command_args="$command_args"
+command_user="root"
+command_background="yes"
+pidfile="/run/$1.pid"
+output_log="$output_log"
+error_log="$error_log"
+
+depend() {
+    need net
+    after firewall
+}
+EOF
+    chmod +x "$path"
 }
 
-# 测试代理功能
-test_proxy() {
-    echo -e "${GREEN}测试 SOCKS5 代理连接...${NC}"
-    
-    # 从配置文件读取端口和认证信息
-    PORT=$(grep -A2 "addr:" /etc/gost/config.yaml | grep -oE ':[0-9]+' | cut -d: -f2 | head -1)
-    USERNAME=$(grep "username:" /etc/gost/config.yaml 2>/dev/null | awk '{print $2}')
-    PASSWORD=$(grep "password:" /etc/gost/config.yaml 2>/dev/null | awk '{print $2}')
-    
-    # 测试连接
-    if [[ -n "$USERNAME" ]] && [[ -n "$PASSWORD" ]]; then
-        # 使用认证测试
-        timeout 5 curl --socks5-hostname "${USERNAME}:${PASSWORD}@127.0.0.1:${PORT}" \
-            -s -o /dev/null -w "%{http_code}" https://www.google.com >/dev/null 2>&1
+create_gost_service() {
+    init_context
+    ensure_service_dependencies
+    mkdir -p /var/log/gost
+    if [[ "$SERVICE_MANAGER" == "openrc" ]]; then
+        write_openrc_service "$GOST_SERVICE" "GOST Proxy Service" "$GOST_BIN" "-C $GOST_CONFIG" "/var/log/gost/gost.log" "/var/log/gost/gost.err"
     else
-        # 无认证测试
-        timeout 5 curl --socks5-hostname "127.0.0.1:${PORT}" \
-            -s -o /dev/null -w "%{http_code}" https://www.google.com >/dev/null 2>&1
+        write_systemd_service "$GOST_SERVICE" "GOST Proxy Service" "$GOST_BIN -C $GOST_CONFIG" "/var/log/gost"
     fi
-    
-    if [ $? -eq 0 ]; then
-        echo -e "${GREEN}✓ 代理连接成功${NC}"
-        echo -e "代理地址: 127.0.0.1:${PORT}"
-        if [[ -n "$USERNAME" ]]; then
-            echo -e "认证方式: 用户名/密码"
-            echo -e "用户名: ${USERNAME}"
+    reload_service_manager
+    enable_service "$GOST_SERVICE"
+}
+
+write_gost_config() {
+    local port="$1"
+    local bind_addr="$2"
+    local use_auth="$3"
+    local username="${4:-}"
+    local password="${5:-}"
+    local log_level="${6:-warn}"
+
+    mkdir -p "$GOST_DIR" /var/log/gost
+    if [[ "$use_auth" == "true" ]]; then
+        cat > "$GOST_CONFIG" <<EOF
+# TUU Toolkit generated GOST SOCKS5 config
+services:
+- name: socks5-service
+  addr: "${bind_addr}:${port}"
+  handler:
+    type: socks5
+    auth:
+      username: "$(yaml_escape "$username")"
+      password: "$(yaml_escape "$password")"
+  listener:
+    type: tcp
+
+log:
+  level: ${log_level}
+  output: /var/log/gost/gost.log
+EOF
+    else
+        cat > "$GOST_CONFIG" <<EOF
+# TUU Toolkit generated GOST SOCKS5 config
+services:
+- name: socks5-service
+  addr: "${bind_addr}:${port}"
+  handler:
+    type: socks5
+  listener:
+    type: tcp
+
+log:
+  level: ${log_level}
+  output: /var/log/gost/gost.log
+EOF
+    fi
+    chmod 600 "$GOST_CONFIG"
+}
+
+install_gost_binary() {
+    install_core_dependencies || return 1
+    init_context
+    local tag version arch url tmp
+    tag="$(get_latest_tag "go-gost/gost" "v3.2.6")"
+    version="${tag#v}"
+    arch="$(gost_arch)"
+    if [[ -z "$arch" ]]; then
+        log_error "GOST 不支持当前架构: $ARCH_RAW"
+        return 1
+    fi
+    url="https://github.com/go-gost/gost/releases/download/${tag}/gost_${version}_linux_${arch}.tar.gz"
+    tmp="$(mktemp -d /tmp/tuu-gost.XXXXXX)"
+    log_info "下载 GOST: $url"
+    if ! download_file "$url" "$tmp/gost.tar.gz"; then
+        rm -rf "$tmp"
+        return 1
+    fi
+    tar -xzf "$tmp/gost.tar.gz" -C "$tmp"
+    if [[ ! -f "$tmp/gost" ]]; then
+        log_error "解压后未找到 gost 可执行文件"
+        rm -rf "$tmp"
+        return 1
+    fi
+    install -m 755 "$tmp/gost" "$GOST_BIN"
+    rm -rf "$tmp"
+    log_success "GOST ${tag} 安装完成: $GOST_BIN"
+}
+
+install_or_update_gost() {
+    require_root
+    init_context
+
+    local port bind_addr use_auth username password log_level
+    if [[ -n "${PORT:-}" ]]; then
+        port="$PORT"
+    else
+        read -r -p "SOCKS5 端口 [默认 1080]: " port
+        port="${port:-1080}"
+    fi
+    if ! valid_port "$port"; then
+        log_error "端口必须在 1-65535 之间"
+        return 1
+    fi
+
+    bind_addr="${BIND_ADDR:-}"
+    if [[ -z "$bind_addr" ]]; then
+        read -r -p "绑定地址 [默认 0.0.0.0]: " bind_addr
+        bind_addr="${bind_addr:-0.0.0.0}"
+    fi
+
+    use_auth="${USE_AUTH:-}"
+    if [[ -z "$use_auth" ]]; then
+        local auth_answer
+        read -r -p "是否启用用户名密码认证? [y/N]: " auth_answer
+        if [[ "$auth_answer" =~ ^[Yy]$ ]]; then
+            use_auth="true"
         else
-            echo -e "认证方式: 无"
+            use_auth="false"
+        fi
+    fi
+
+    if [[ "$use_auth" == "true" ]]; then
+        username="${USERNAME:-}"
+        password="${PASSWORD:-}"
+        [[ -z "$username" ]] && read -r -p "用户名: " username
+        [[ -z "$password" ]] && read -r -s -p "密码: " password && echo
+        if [[ -z "$username" || -z "$password" ]]; then
+            log_error "启用认证时用户名和密码不能为空"
+            return 1
         fi
     else
-        echo -e "${RED}✗ 代理连接失败${NC}"
-        echo -e "${YELLOW}请检查服务是否正在运行${NC}"
+        username=""
+        password=""
+    fi
+
+    log_level="${LOG_LEVEL:-warn}"
+    install_gost_binary || return 1
+    write_gost_config "$port" "$bind_addr" "$use_auth" "$username" "$password" "$log_level"
+    create_gost_service
+    open_firewall_port "$port" tcp
+    service_action "$GOST_SERVICE" restart || log_warn "服务未能自动重启，请在完整 init 环境中手动启动"
+    log_success "GOST SOCKS5 配置完成"
+}
+
+show_gost_info() {
+    echo -e "${CYAN}GOST 状态:${NC} $(service_status_text "$GOST_SERVICE")"
+    echo -e "${CYAN}二进制:${NC} $GOST_BIN"
+    echo -e "${CYAN}配置文件:${NC} $GOST_CONFIG"
+    if [[ -x "$GOST_BIN" ]]; then
+        "$GOST_BIN" -V 2>/dev/null || true
+    fi
+    if [[ -f "$GOST_CONFIG" ]]; then
+        echo
+        sed -n '1,160p' "$GOST_CONFIG"
     fi
 }
 
-# 更新 Gost
-update_gost() {
-    echo -e "${GREEN}检查 Gost 更新...${NC}"
-    
-    # 获取当前版本
-    CURRENT_VERSION=$(gost -V 2>&1 | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' || echo "unknown")
-    echo -e "当前版本: ${CURRENT_VERSION}"
-    
-    # 获取最新版本
-    LATEST_VERSION=$(curl -s https://api.github.com/repos/go-gost/gost/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
-    echo -e "最新版本: ${LATEST_VERSION}"
-    
-    if [[ "$CURRENT_VERSION" == "$LATEST_VERSION" ]]; then
-        echo -e "${GREEN}已是最新版本${NC}"
-    else
-        echo -e "${YELLOW}发现新版本，是否更新? [y/N]:${NC} "
-        read -r CONFIRM
-        if [[ "$CONFIRM" =~ ^[Yy]$ ]]; then
-            # 下载更新脚本并执行
-            bash <(curl -fsSL https://raw.githubusercontent.com/phyrevue/tuu-toolkit/main/tuu-toolkit.sh)
+uninstall_gost() {
+    require_root
+    if ! confirm "确认卸载 GOST 配置和服务?"; then
+        return
+    fi
+    service_action "$GOST_SERVICE" stop || true
+    if [[ "$SERVICE_MANAGER" == "systemd" ]]; then
+        if systemd_is_running; then
+            systemctl disable "$GOST_SERVICE" >/dev/null 2>&1 || true
         fi
+        rm -f "/etc/systemd/system/${GOST_SERVICE}.service"
+    else
+        if command -v rc-update >/dev/null 2>&1; then
+            rc-update del "$GOST_SERVICE" default >/dev/null 2>&1 || true
+        fi
+        rm -f "/etc/init.d/${GOST_SERVICE}"
+    fi
+    rm -rf "$GOST_DIR"
+    rm -f "$GOST_BIN"
+    reload_service_manager
+    log_success "GOST 已卸载"
+}
+
+ss_arch() {
+    linux_rust_target "$LIBC_KIND"
+}
+
+install_ss_binary() {
+    install_archive_dependencies || return 1
+    init_context
+    local tag version arch file url tmp
+    tag="$(get_latest_tag "shadowsocks/shadowsocks-rust" "v1.24.0")"
+    version="${tag#v}"
+    arch="$(ss_arch)"
+    if [[ -z "$arch" ]]; then
+        log_error "Shadowsocks Rust 不支持当前架构: $ARCH_RAW / $LIBC_KIND"
+        return 1
+    fi
+    file="shadowsocks-v${version}.${arch}.tar.xz"
+    url="https://github.com/shadowsocks/shadowsocks-rust/releases/download/v${version}/${file}"
+    tmp="$(mktemp -d /tmp/tuu-ss.XXXXXX)"
+    mkdir -p "$SS_DIR"
+    log_info "下载 Shadowsocks Rust: $url"
+    if ! download_file "$url" "$tmp/$file"; then
+        rm -rf "$tmp"
+        return 1
+    fi
+    tar -xf "$tmp/$file" -C "$tmp"
+    if [[ ! -f "$tmp/ssserver" ]]; then
+        log_error "解压后未找到 ssserver"
+        rm -rf "$tmp"
+        return 1
+    fi
+    install -m 755 "$tmp/ssserver" "$SS_BIN"
+    echo "v${version}" > "$SS_VERSION_FILE"
+    rm -rf "$tmp"
+    log_success "Shadowsocks Rust v${version} 安装完成: $SS_BIN"
+}
+
+write_ss_config() {
+    local port="$1"
+    local password="$2"
+    local method="$3"
+    local fast_open="$4"
+    local dns="${5:-}"
+
+    mkdir -p "$SS_DIR"
+    local password_json method_json dns_json
+    password_json="$(json_escape "$password")"
+    method_json="$(json_escape "$method")"
+    if [[ -n "$dns" ]]; then
+        dns_json=",\n    \"nameserver\": \"$(json_escape "$dns")\""
+    else
+        dns_json=""
+    fi
+    {
+        printf '{\n'
+        printf '    "server": "::",\n'
+        printf '    "server_port": %s,\n' "$port"
+        printf '    "password": "%s",\n' "$password_json"
+        printf '    "method": "%s",\n' "$method_json"
+        printf '    "fast_open": %s,\n' "$fast_open"
+        printf '    "mode": "tcp_and_udp",\n'
+        printf '    "timeout": 300'
+        printf '%b\n' "$dns_json"
+        printf '}\n'
+    } > "$SS_CONFIG"
+    chmod 600 "$SS_CONFIG"
+}
+
+create_ss_service() {
+    init_context
+    ensure_service_dependencies
+    if [[ "$SERVICE_MANAGER" == "openrc" ]]; then
+        write_openrc_service "$SS_SERVICE" "Shadowsocks Rust Service" "$SS_BIN" "-c $SS_CONFIG" "/var/log/ss-rust.log" "/var/log/ss-rust.err"
+    else
+        write_systemd_service "$SS_SERVICE" "Shadowsocks Rust Service" "$SS_BIN -c $SS_CONFIG" "$SS_DIR"
+    fi
+    reload_service_manager
+    enable_service "$SS_SERVICE"
+}
+
+choose_ss_method() {
+    local choice method
+    echo "请选择 Shadowsocks 加密方式:" >&2
+    echo "1) 2022-blake3-aes-256-gcm (默认)" >&2
+    echo "2) 2022-blake3-chacha20-poly1305" >&2
+    echo "3) aes-256-gcm" >&2
+    echo "4) chacha20-ietf-poly1305" >&2
+    read -r -p "选项 [1-4]: " choice
+    case "${choice:-1}" in
+        1) method="2022-blake3-aes-256-gcm" ;;
+        2) method="2022-blake3-chacha20-poly1305" ;;
+        3) method="aes-256-gcm" ;;
+        4) method="chacha20-ietf-poly1305" ;;
+        *) method="2022-blake3-aes-256-gcm" ;;
+    esac
+    echo "$method"
+}
+
+default_ss_password_bytes() {
+    case "$1" in
+        2022-blake3-aes-128-gcm) echo 16 ;;
+        2022-blake3-aes-256-gcm|2022-blake3-chacha20-poly1305|2022-blake3-chacha8-poly1305) echo 32 ;;
+        *) echo 24 ;;
+    esac
+}
+
+install_or_update_ss() {
+    require_root
+    init_context
+    local port method password fast_open dns suggested_port
+
+    suggested_port="$(random_port)"
+    read -r -p "SS 端口 [默认 ${suggested_port}]: " port
+    port="${port:-$suggested_port}"
+    if ! valid_port "$port"; then
+        log_error "端口必须在 1-65535 之间"
+        return 1
+    fi
+
+    method="$(choose_ss_method)"
+    read -r -p "SS 密码 [默认自动生成]: " password
+    if [[ -z "$password" ]]; then
+        password="$(random_password "$(default_ss_password_bytes "$method")")"
+    fi
+
+    read -r -p "是否开启 TCP Fast Open? [y/N]: " fast_open
+    if [[ "$fast_open" =~ ^[Yy]$ ]]; then
+        fast_open="true"
+    else
+        fast_open="false"
+    fi
+    read -r -p "DNS 服务器 [可空]: " dns
+
+    install_ss_binary || return 1
+    write_ss_config "$port" "$password" "$method" "$fast_open" "$dns"
+    create_ss_service
+    open_firewall_port "$port" tcp
+    open_firewall_port "$port" udp
+    service_action "$SS_SERVICE" restart || log_warn "服务未能自动重启，请在完整 init 环境中手动启动"
+
+    echo
+    log_success "Shadowsocks Rust 配置完成"
+    echo "端口: $port"
+    echo "密码: $password"
+    echo "加密: $method"
+}
+
+show_ss_info() {
+    echo -e "${CYAN}SS 状态:${NC} $(service_status_text "$SS_SERVICE")"
+    echo -e "${CYAN}二进制:${NC} $SS_BIN"
+    echo -e "${CYAN}配置文件:${NC} $SS_CONFIG"
+    [[ -f "$SS_VERSION_FILE" ]] && echo -e "${CYAN}版本:${NC} $(cat "$SS_VERSION_FILE")"
+    if [[ -f "$SS_CONFIG" ]]; then
+        echo
+        sed -n '1,120p' "$SS_CONFIG"
     fi
 }
 
-case "$1" in
-    start)
-        echo -e "${GREEN}启动 Gost SOCKS5 服务...${NC}"
-        systemctl start gost
-        systemctl status gost --no-pager
+uninstall_ss() {
+    require_root
+    if ! confirm "确认卸载 Shadowsocks Rust?"; then
+        return
+    fi
+    service_action "$SS_SERVICE" stop || true
+    if [[ "$SERVICE_MANAGER" == "systemd" ]]; then
+        if systemd_is_running; then
+            systemctl disable "$SS_SERVICE" >/dev/null 2>&1 || true
+        fi
+        rm -f "/etc/systemd/system/${SS_SERVICE}.service"
+    else
+        if command -v rc-update >/dev/null 2>&1; then
+            rc-update del "$SS_SERVICE" default >/dev/null 2>&1 || true
+        fi
+        rm -f "/etc/init.d/${SS_SERVICE}"
+    fi
+    rm -rf "$SS_DIR"
+    rm -f "$SS_BIN"
+    reload_service_manager
+    log_success "Shadowsocks Rust 已卸载"
+}
+
+realm_arch() {
+    linux_rust_target "$LIBC_KIND"
+}
+
+create_default_realm_config() {
+    mkdir -p "$REALM_DIR"
+    if [[ ! -f "$REALM_CONFIG" ]]; then
+        cat > "$REALM_CONFIG" <<'EOF'
+[network]
+no_tcp = false
+use_udp = true
+EOF
+    fi
+}
+
+create_realm_service() {
+    init_context
+    ensure_service_dependencies
+    mkdir -p "$REALM_DIR" /var/log
+    if [[ "$SERVICE_MANAGER" == "openrc" ]]; then
+        write_openrc_service "$REALM_SERVICE" "Realm Proxy Service" "$REALM_BIN" "-c $REALM_CONFIG" "/var/log/realm.log" "/var/log/realm.err"
+    else
+        write_systemd_service "$REALM_SERVICE" "Realm Proxy Service" "$REALM_BIN -c $REALM_CONFIG" "$REALM_DIR /var/log"
+    fi
+    reload_service_manager
+    enable_service "$REALM_SERVICE"
+}
+
+install_or_update_realm() {
+    require_root
+    install_core_dependencies || return 1
+    init_context
+    local tag version arch url tmp
+    tag="$(get_latest_tag "zhboner/realm" "v2.9.4")"
+    version="${tag#v}"
+    arch="$(realm_arch)"
+    if [[ -z "$arch" ]]; then
+        log_error "Realm 不支持当前架构: $ARCH_RAW / $LIBC_KIND"
+        return 1
+    fi
+    url="https://github.com/zhboner/realm/releases/download/v${version}/realm-${arch}.tar.gz"
+    tmp="$(mktemp -d /tmp/tuu-realm.XXXXXX)"
+    mkdir -p "$REALM_DIR"
+    log_info "下载 Realm: $url"
+    if ! download_file "$url" "$tmp/realm.tar.gz"; then
+        rm -rf "$tmp"
+        return 1
+    fi
+    tar -xzf "$tmp/realm.tar.gz" -C "$tmp"
+    if [[ ! -f "$tmp/realm" ]]; then
+        log_error "解压后未找到 realm 主程序"
+        rm -rf "$tmp"
+        return 1
+    fi
+    install -m 755 "$tmp/realm" "$REALM_BIN"
+    rm -rf "$tmp"
+    create_default_realm_config
+    create_realm_service
+    write_log "Realm installed/updated ${tag}"
+    log_success "Realm ${tag} 安装/更新完成"
+}
+
+realm_service_restart_if_ready() {
+    if [[ -x "$REALM_BIN" ]]; then
+        service_action "$REALM_SERVICE" restart || log_warn "Realm 服务未能自动重启，请在完整 init 环境中手动启动"
+    fi
+}
+
+show_realm_rules() {
+    echo -e "                   ${YELLOW}当前 Realm 转发规则${NC}"
+    echo -e "${BLUE}---------------------------------------------------------------------------------------------------------${NC}"
+    printf "%-5s| %-30s| %-40s| %-20s\n" "序号" "本地地址:端口" "目标地址:端口" "备注"
+    echo -e "${BLUE}---------------------------------------------------------------------------------------------------------${NC}"
+
+    if [[ ! -f "$REALM_CONFIG" ]]; then
+        log_error "配置文件不存在: $REALM_CONFIG"
+        return 1
+    fi
+
+    local lines=()
+    mapfile -t lines < <(grep -n 'listen =' "$REALM_CONFIG" || true)
+    if [[ ${#lines[@]} -eq 0 ]]; then
+        echo "没有发现任何转发规则。"
+        return 0
+    fi
+
+    local index=1
+    local line line_number listen_info remote_info remark
+    for line in "${lines[@]}"; do
+        line_number="$(echo "$line" | cut -d ':' -f 1)"
+        listen_info="$(sed -n "${line_number}p" "$REALM_CONFIG" | cut -d '"' -f 2)"
+        remote_info="$(sed -n "$((line_number + 1))p" "$REALM_CONFIG" | cut -d '"' -f 2)"
+        remark="$(sed -n "$((line_number - 1))p" "$REALM_CONFIG" | sed -n 's/^# 备注:[[:space:]]*//p')"
+        printf "%-5s| %-30s| %-40s| %-20s\n" "$index" "$listen_info" "$remote_info" "$remark"
+        echo -e "${BLUE}---------------------------------------------------------------------------------------------------------${NC}"
+        index=$((index + 1))
+    done
+}
+
+add_realm_rule() {
+    require_root
+    create_default_realm_config
+    local local_port remote_host remote_port remark ip_choice listen_addr
+
+    read -r -p "本地监听端口: " local_port
+    if ! valid_port "$local_port"; then
+        log_error "本地端口必须在 1-65535 之间"
+        return 1
+    fi
+    read -r -p "目标服务器 IP/域名: " remote_host
+    read -r -p "目标端口: " remote_port
+    if [[ -z "$remote_host" ]] || ! valid_port "$remote_port"; then
+        log_error "目标地址不能为空，目标端口必须在 1-65535 之间"
+        return 1
+    fi
+    read -r -p "规则备注: " remark
+
+    echo
+    echo "请选择监听模式:"
+    echo "1) 双栈监听 [::]:${local_port} (默认)"
+    echo "2) 仅 IPv4 监听 0.0.0.0:${local_port}"
+    echo "3) 自定义监听地址"
+    read -r -p "选项 [1-3]: " ip_choice
+    case "${ip_choice:-1}" in
+        1) listen_addr="[::]:$local_port" ;;
+        2) listen_addr="0.0.0.0:$local_port" ;;
+        3)
+            read -r -p "完整监听地址，例如 0.0.0.0:80 或 [::]:443: " listen_addr
+            if [[ ! "$listen_addr" =~ .+:[0-9]+$ ]]; then
+                log_error "监听地址格式错误"
+                return 1
+            fi
+            ;;
+        *) listen_addr="[::]:$local_port" ;;
+    esac
+
+    cat >> "$REALM_CONFIG" <<EOF
+
+[[endpoints]]
+# 备注: $remark
+listen = "$listen_addr"
+remote = "$remote_host:$remote_port"
+EOF
+    write_log "Realm rule added: $listen_addr -> $remote_host:$remote_port"
+    open_firewall_port "$local_port" tcp
+    open_firewall_port "$local_port" udp
+    realm_service_restart_if_ready
+    log_success "Realm 规则添加成功"
+}
+
+delete_realm_rule() {
+    require_root
+    if [[ ! -f "$REALM_CONFIG" ]]; then
+        log_error "配置文件不存在: $REALM_CONFIG"
+        return 1
+    fi
+
+    show_realm_rules
+    local lines=()
+    mapfile -t lines < <(grep -n '^\[\[endpoints\]\]' "$REALM_CONFIG" || true)
+    if [[ ${#lines[@]} -eq 0 ]]; then
+        return 0
+    fi
+
+    local choice start_line next_line end_line
+    read -r -p "请输入要删除的规则序号，直接回车返回: " choice
+    [[ -z "$choice" ]] && return 0
+    if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#lines[@]} )); then
+        log_error "无效序号"
+        return 1
+    fi
+
+    start_line="$(echo "${lines[$((choice - 1))]}" | cut -d ':' -f 1)"
+    next_line="$(grep -n '^\[\[endpoints\]\]' "$REALM_CONFIG" | awk -F: -v s="$start_line" '$1 > s {print $1; exit}')"
+    if [[ -z "$next_line" ]]; then
+        end_line="$(wc -l < "$REALM_CONFIG")"
+    else
+        end_line=$((next_line - 1))
+    fi
+
+    sed -i "${start_line},${end_line}d" "$REALM_CONFIG"
+    sed -i '/^[[:space:]]*$/d' "$REALM_CONFIG"
+    write_log "Realm rule deleted: $choice"
+    realm_service_restart_if_ready
+    log_success "Realm 规则已删除"
+}
+
+manage_realm_cron() {
+    require_root
+    init_context
+    echo "1) 添加每日重启任务"
+    echo "2) 删除所有 Realm 定时任务"
+    echo "3) 查看当前 Realm 定时任务"
+    read -r -p "请选择: " choice
+
+    local hour
+    case "$choice" in
+        1)
+            read -r -p "输入每日重启时间，0-23: " hour
+            if ! [[ "$hour" =~ ^[0-9]+$ ]] || (( hour < 0 || hour > 23 )); then
+                log_error "时间无效"
+                return 1
+            fi
+            install_packages cron
+            if [[ "$SERVICE_MANAGER" == "openrc" ]]; then
+                mkdir -p /etc/crontabs
+                touch /etc/crontabs/root
+                sed -i '/realm/d' /etc/crontabs/root
+                echo "0 $hour * * * rc-service realm restart" >> /etc/crontabs/root
+                if command -v rc-update >/dev/null 2>&1; then
+                    rc-update add crond default >/dev/null 2>&1 || true
+                fi
+                if command -v rc-service >/dev/null 2>&1; then
+                    rc-service crond restart >/dev/null 2>&1 || true
+                fi
+            else
+                cat > /etc/cron.d/realm-restart <<EOF
+0 $hour * * * root systemctl restart realm
+EOF
+            fi
+            log_success "已添加每日 ${hour}:00 重启 Realm"
+            ;;
+        2)
+            [[ -f /etc/crontabs/root ]] && sed -i '/realm/d' /etc/crontabs/root
+            rm -f /etc/cron.d/realm-restart
+            log_success "已删除 Realm 定时任务"
+            ;;
+        3)
+            grep -h "realm" /etc/crontabs/root /etc/cron.d/realm-restart 2>/dev/null || echo "无 Realm 定时任务"
+            ;;
+        *)
+            log_error "无效选择"
+            ;;
+    esac
+}
+
+show_realm_logs() {
+    echo -e "\n${BLUE}===== Realm 标准日志 /var/log/realm.log =====${NC}"
+    [[ -f /var/log/realm.log ]] && tail -n 50 /var/log/realm.log || echo "暂无日志"
+    echo -e "\n${BLUE}===== Realm 错误日志 /var/log/realm.err =====${NC}"
+    [[ -f /var/log/realm.err ]] && tail -n 50 /var/log/realm.err || echo "暂无错误日志"
+    echo -e "\n${BLUE}===== 脚本日志 $LOG_FILE =====${NC}"
+    [[ -f "$LOG_FILE" ]] && tail -n 30 "$LOG_FILE" || echo "暂无脚本日志"
+}
+
+manual_test_realm() {
+    if [[ ! -x "$REALM_BIN" ]]; then
+        log_error "Realm 主程序不存在，请先安装"
+        return 1
+    fi
+    if [[ ! -f "$REALM_CONFIG" ]]; then
+        log_error "Realm 配置文件不存在"
+        return 1
+    fi
+    echo -e "${YELLOW}即将前台运行 Realm，按 Ctrl+C 退出。${NC}"
+    "$REALM_BIN" -c "$REALM_CONFIG"
+}
+
+uninstall_realm() {
+    require_root
+    if ! confirm "确认完全卸载 Realm?"; then
+        return
+    fi
+    service_action "$REALM_SERVICE" stop || true
+    if [[ "$SERVICE_MANAGER" == "systemd" ]]; then
+        if systemd_is_running; then
+            systemctl disable "$REALM_SERVICE" >/dev/null 2>&1 || true
+        fi
+        rm -f "/etc/systemd/system/${REALM_SERVICE}.service"
+    else
+        if command -v rc-update >/dev/null 2>&1; then
+            rc-update del "$REALM_SERVICE" default >/dev/null 2>&1 || true
+        fi
+        rm -f "/etc/init.d/${REALM_SERVICE}"
+    fi
+    rm -rf "$REALM_DIR"
+    rm -f /var/log/realm.log /var/log/realm.err /etc/cron.d/realm-restart
+    [[ -f /etc/crontabs/root ]] && sed -i '/realm/d' /etc/crontabs/root
+    reload_service_manager
+    write_log "Realm uninstalled"
+    log_success "Realm 已完全卸载"
+}
+
+show_realm_info() {
+    echo -e "${CYAN}Realm 状态:${NC} $(service_status_text "$REALM_SERVICE")"
+    echo -e "${CYAN}二进制:${NC} $REALM_BIN"
+    echo -e "${CYAN}配置文件:${NC} $REALM_CONFIG"
+    if [[ -x "$REALM_BIN" ]]; then
+        "$REALM_BIN" -v 2>/dev/null || true
+    fi
+    if [[ -f "$REALM_CONFIG" ]]; then
+        echo
+        show_realm_rules
+    fi
+}
+
+gost_menu() {
+    while true; do
+        clear_screen
+        echo -e "${BOLD}TUU Toolkit - GOST SOCKS5${NC}"
+        echo "状态: $(service_status_text "$GOST_SERVICE")"
+        echo "1) 安装/更新 GOST SOCKS5"
+        echo "2) 启动服务"
+        echo "3) 停止服务"
+        echo "4) 重启服务"
+        echo "5) 查看状态/配置"
+        echo "6) 卸载 GOST"
+        echo "0) 返回"
+        read -r -p "请选择: " choice
+        case "$choice" in
+            1) install_or_update_gost; pause ;;
+            2) service_action "$GOST_SERVICE" start; pause ;;
+            3) service_action "$GOST_SERVICE" stop; pause ;;
+            4) service_action "$GOST_SERVICE" restart; pause ;;
+            5) show_gost_info; pause ;;
+            6) uninstall_gost; pause ;;
+            0) return ;;
+            *) log_error "无效选项"; pause ;;
+        esac
+    done
+}
+
+ss_menu() {
+    while true; do
+        clear_screen
+        echo -e "${BOLD}TUU Toolkit - Shadowsocks Rust${NC}"
+        echo "状态: $(service_status_text "$SS_SERVICE")"
+        echo "1) 安装/更新 Shadowsocks Rust"
+        echo "2) 启动服务"
+        echo "3) 停止服务"
+        echo "4) 重启服务"
+        echo "5) 查看状态/配置"
+        echo "6) 卸载 Shadowsocks Rust"
+        echo "0) 返回"
+        read -r -p "请选择: " choice
+        case "$choice" in
+            1) install_or_update_ss; pause ;;
+            2) service_action "$SS_SERVICE" start; pause ;;
+            3) service_action "$SS_SERVICE" stop; pause ;;
+            4) service_action "$SS_SERVICE" restart; pause ;;
+            5) show_ss_info; pause ;;
+            6) uninstall_ss; pause ;;
+            0) return ;;
+            *) log_error "无效选项"; pause ;;
+        esac
+    done
+}
+
+realm_menu() {
+    while true; do
+        clear_screen
+        echo -e "${BOLD}TUU Toolkit - Realm${NC}"
+        echo "状态: $(service_status_text "$REALM_SERVICE")"
+        echo "配置目录: $REALM_DIR"
+        echo "1) 安装/更新 Realm"
+        echo "2) 添加转发规则"
+        echo "3) 查看转发规则"
+        echo "4) 删除转发规则"
+        echo "5) 启动服务"
+        echo "6) 停止服务"
+        echo "7) 重启服务"
+        echo "8) 定时任务管理"
+        echo "9) 查看日志"
+        echo "10) 前台测试运行 Realm"
+        echo "11) 查看安装信息"
+        echo "12) 完全卸载 Realm"
+        echo "0) 返回"
+        read -r -p "请选择: " choice
+        case "$choice" in
+            1) install_or_update_realm; pause ;;
+            2) add_realm_rule; pause ;;
+            3) show_realm_rules; pause ;;
+            4) delete_realm_rule; pause ;;
+            5) service_action "$REALM_SERVICE" start; pause ;;
+            6) service_action "$REALM_SERVICE" stop; pause ;;
+            7) service_action "$REALM_SERVICE" restart; pause ;;
+            8) manage_realm_cron; pause ;;
+            9) show_realm_logs; pause ;;
+            10) manual_test_realm; pause ;;
+            11) show_realm_info; pause ;;
+            12) uninstall_realm; pause ;;
+            0) return ;;
+            *) log_error "无效选项"; pause ;;
+        esac
+    done
+}
+
+main_menu() {
+    need_bash
+    require_root
+    init_context
+
+    while true; do
+        clear_screen
+        echo -e "${YELLOW}========================================${NC}"
+        echo -e "${BOLD}             TUU Toolkit ${TOOL_VERSION}${NC}"
+        echo -e "${YELLOW}========================================${NC}"
+        echo "项目: $REPO_URL"
+        echo "系统: ${OS_NAME:-unknown}"
+        echo "系统族: $OS_FAMILY | 包管理器: $PKG_MANAGER | 服务: $SERVICE_MANAGER | libc: $LIBC_KIND"
+        echo "架构: $ARCH_RAW"
+        echo
+        echo "1) GOST SOCKS5 管理"
+        echo "2) Shadowsocks Rust 管理"
+        echo "3) Realm 转发管理"
+        echo "4) 系统检测"
+        echo "5) 安装基础依赖"
+        echo "0) 退出"
+        echo -e "${YELLOW}========================================${NC}"
+        read -r -p "请选择: " choice
+        case "$choice" in
+            1) gost_menu ;;
+            2) ss_menu ;;
+            3) realm_menu ;;
+            4) print_system_info; pause ;;
+            5) install_core_dependencies; pause ;;
+            0) exit 0 ;;
+            *) log_error "无效选项"; pause ;;
+        esac
+        init_context
+    done
+}
+
+case "${1:-}" in
+    --check)
+        need_bash
+        print_system_info
         ;;
-    stop)
-        echo -e "${YELLOW}停止 Gost SOCKS5 服务...${NC}"
-        systemctl stop gost
+    --version|-v)
+        echo "$TOOL_VERSION"
         ;;
-    restart)
-        echo -e "${YELLOW}重启 Gost SOCKS5 服务...${NC}"
-        systemctl restart gost
-        systemctl status gost --no-pager
+    --help|-h)
+        cat <<EOF
+TUU Toolkit ${TOOL_VERSION}
+
+用法:
+  bash <(curl -fsSL ${RAW_URL})
+  bash tuu-toolkit.sh
+  bash tuu-toolkit.sh --check
+
+功能:
+  - GOST SOCKS5 安装与服务管理
+  - Shadowsocks Rust 安装与服务管理
+  - Realm 安装、转发规则与服务管理
+
+支持:
+  Debian/Ubuntu + systemd
+  Alpine + OpenRC
+  CentOS/RHEL/Rocky/Alma + systemd
+EOF
         ;;
-    status)
-        systemctl status gost --no-pager
-        ;;
-    logs)
-        echo -e "${BLUE}查看最近的日志...${NC}"
-        journalctl -u gost -n 50 --no-pager
-        ;;
-    config)
-        echo -e "${BLUE}当前配置:${NC}"
-        cat /etc/gost/config.yaml
-        ;;
-    test)
-        test_proxy
-        ;;
-    update)
-        update_gost
-        ;;
-    help|*)
-        show_help
+    *)
+        main_menu "$@"
         ;;
 esac
-EOF
-    
-    chmod +x /usr/local/bin/tuu-toolkit
-    
-    log_success "管理脚本已创建: tuu-toolkit"
-}
-
-# 配置防火墙
-configure_firewall() {
-    log_info "配置防火墙..."
-    
-    # 检查并配置 firewalld
-    if systemctl is-active --quiet firewalld; then
-        firewall-cmd --permanent --add-port=${PORT}/tcp
-        firewall-cmd --reload
-        log_success "firewalld 规则已添加"
-    # 检查并配置 ufw
-    elif command -v ufw &> /dev/null && ufw status | grep -q "Status: active"; then
-        ufw allow ${PORT}/tcp
-        log_success "ufw 规则已添加"
-    # 检查并配置 iptables
-    elif command -v iptables &> /dev/null; then
-        iptables -A INPUT -p tcp --dport ${PORT} -j ACCEPT
-        # 保存规则
-        if command -v netfilter-persistent &> /dev/null; then
-            netfilter-persistent save
-        elif command -v iptables-save &> /dev/null; then
-            iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
-        fi
-        log_success "iptables 规则已添加"
-    else
-        log_warn "未检测到防火墙，请手动配置端口 ${PORT} 的访问规则"
-    fi
-}
-
-# 显示安装信息
-show_info() {
-    echo ""
-    echo -e "${GREEN}======================================${NC}"
-    echo -e "${GREEN}    Gost SOCKS5 安装成功!${NC}"
-    echo -e "${GREEN}======================================${NC}"
-    echo ""
-    echo -e "${BLUE}服务状态:${NC}"
-    systemctl status gost --no-pager | head -n 3
-    echo ""
-    echo -e "${BLUE}代理信息:${NC}"
-    echo -e "协议: SOCKS5"
-    echo -e "地址: ${BIND_ADDR}:${PORT}"
-    
-    if [[ "$USE_AUTH" == "true" ]]; then
-        echo -e "认证: 启用"
-        echo -e "用户名: ${USERNAME}"
-        echo -e "密码: ${PASSWORD}"
-    else
-        echo -e "认证: 禁用"
-    fi
-    
-    echo ""
-    echo -e "${BLUE}管理命令:${NC}"
-    echo -e "启动服务: tuu-toolkit start"
-    echo -e "停止服务: tuu-toolkit stop"
-    echo -e "重启服务: tuu-toolkit restart"
-    echo -e "查看状态: tuu-toolkit status"
-    echo -e "查看日志: tuu-toolkit logs"
-    echo -e "测试代理: tuu-toolkit test"
-    echo -e "更新版本: tuu-toolkit update"
-    echo ""
-    echo -e "${BLUE}配置文件:${NC} /etc/gost/config.yaml"
-    echo -e "${BLUE}日志文件:${NC} /var/log/gost/gost.log"
-    echo ""
-    
-    # 获取服务器 IP
-    SERVER_IP=$(curl -s4 ip.sb 2>/dev/null || curl -s4 ipinfo.io/ip 2>/dev/null || echo "YOUR_SERVER_IP")
-    
-    echo -e "${BLUE}客户端配置示例:${NC}"
-    if [[ "$USE_AUTH" == "true" ]]; then
-        echo -e "curl --socks5-hostname ${USERNAME}:${PASSWORD}@${SERVER_IP}:${PORT} https://www.google.com"
-    else
-        echo -e "curl --socks5-hostname ${SERVER_IP}:${PORT} https://www.google.com"
-    fi
-    echo ""
-    echo -e "${GREEN}======================================${NC}"
-}
-
-# 主函数
-main() {
-    clear
-    echo -e "${BLUE}TUU Toolkit 一键部署脚本${NC}"
-    echo -e "${BLUE}项目地址: https://github.com/phyrevue/tuu-toolkit${NC}"
-    echo ""
-    
-    # 检查是否为 root
-    check_root
-    
-    # 检测系统
-    detect_system
-    
-    # 获取最新版本
-    get_latest_version
-    
-    # 设置下载链接
-    set_download_url
-    
-    # 检查是否通过环境变量传入了配置
-    if [[ -n "$PORT" ]] && [[ -n "$USE_AUTH" ]]; then
-        # 静默安装模式
-        log_info "使用预设配置进行安装..."
-        log_info "端口: $PORT"
-        log_info "认证: $USE_AUTH"
-        
-        # 验证端口
-        if ! [[ "$PORT" =~ ^[0-9]+$ ]] || [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
-            log_error "端口必须是1-65535之间的数字"
-            exit 1
-        fi
-        
-        # 设置默认值
-        BIND_ADDR=${BIND_ADDR:-0.0.0.0}
-        LOG_LEVEL=${LOG_LEVEL:-warn}
-        
-        # 如果启用认证，检查用户名和密码
-        if [[ "$USE_AUTH" == "true" ]]; then
-            if [[ -z "$USERNAME" ]] || [[ -z "$PASSWORD" ]]; then
-                log_error "启用认证时必须提供用户名和密码"
-                exit 1
-            fi
-        fi
-    else
-        # 交互式配置
-        configure_interactive
-    fi
-    
-    # 安装流程
-    install_dependencies
-    install_gost
-    generate_config
-    create_systemd_service
-    create_management_script
-    configure_firewall
-    
-    # 启动服务
-    log_info "启动 Gost 服务..."
-    systemctl start gost
-    
-    # 等待服务启动
-    sleep 2
-    
-    # 检查服务状态
-    if systemctl is-active --quiet gost; then
-        log_success "Gost 服务启动成功"
-    else
-        log_error "Gost 服务启动失败"
-        log_info "请查看日志: journalctl -u gost -n 50"
-        exit 1
-    fi
-    
-    # 显示安装信息
-    show_info
-}
-
-# 运行主函数
-main "$@"
