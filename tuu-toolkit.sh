@@ -3,11 +3,11 @@
 # TUU Toolkit 一键管理脚本
 # 项目地址: https://github.com/phyrevue/tuu-toolkit
 # 支持: Debian/Ubuntu, Alpine, CentOS/RHEL/Rocky/Alma
-# Version: 2.0.1
+# Version: 2.0.2
 
 set -o pipefail
 
-TOOL_VERSION="2.0.1"
+TOOL_VERSION="2.0.2"
 REPO_URL="https://github.com/phyrevue/tuu-toolkit"
 RAW_URL="https://raw.githubusercontent.com/phyrevue/tuu-toolkit/main/tuu-toolkit.sh"
 LOG_FILE="/var/log/tuu-toolkit.log"
@@ -339,6 +339,18 @@ linux_rust_target() {
 
 json_escape() {
     printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+json_get_string() {
+    local file="$1"
+    local key="$2"
+    sed -nE "s/^[[:space:]]*\"${key}\"[[:space:]]*:[[:space:]]*\"(.*)\"[,]?[[:space:]]*$/\1/p" "$file" | head -n1
+}
+
+json_get_scalar() {
+    local file="$1"
+    local key="$2"
+    sed -nE "s/^[[:space:]]*\"${key}\"[[:space:]]*:[[:space:]]*([^,[:space:]]+)[,]?[[:space:]]*$/\1/p" "$file" | head -n1
 }
 
 yaml_escape() {
@@ -901,13 +913,54 @@ install_or_update_ss() {
 }
 
 show_ss_info() {
+    local version server port password method fast_open mode timeout dns server_ip ss_uri tfo_text
+
     echo -e "${CYAN}SS 状态:${NC} $(service_status_text "$SS_SERVICE")"
     echo -e "${CYAN}二进制:${NC} $SS_BIN"
     echo -e "${CYAN}配置文件:${NC} $SS_CONFIG"
-    [[ -f "$SS_VERSION_FILE" ]] && echo -e "${CYAN}版本:${NC} $(cat "$SS_VERSION_FILE")"
-    if [[ -f "$SS_CONFIG" ]]; then
-        echo
-        sed -n '1,120p' "$SS_CONFIG"
+    if [[ -f "$SS_VERSION_FILE" ]]; then
+        version="$(cat "$SS_VERSION_FILE")"
+    else
+        version="未知"
+    fi
+    echo -e "${CYAN}版本:${NC} $version"
+
+    if [[ ! -f "$SS_CONFIG" ]]; then
+        log_warn "SS 配置文件不存在"
+        return 0
+    fi
+
+    server="$(json_get_string "$SS_CONFIG" server)"
+    port="$(json_get_scalar "$SS_CONFIG" server_port)"
+    password="$(json_get_string "$SS_CONFIG" password)"
+    method="$(json_get_string "$SS_CONFIG" method)"
+    fast_open="$(json_get_scalar "$SS_CONFIG" fast_open)"
+    mode="$(json_get_string "$SS_CONFIG" mode)"
+    timeout="$(json_get_scalar "$SS_CONFIG" timeout)"
+    dns="$(json_get_string "$SS_CONFIG" nameserver)"
+
+    if [[ "$fast_open" == "true" ]]; then
+        tfo_text="启用"
+    else
+        tfo_text="禁用"
+    fi
+
+    echo
+    echo -e "${YELLOW}Shadowsocks 配置信息${NC}"
+    echo "监听地址: ${server:-::}"
+    echo "端口: ${port:-未知}"
+    echo "密码: ${password:-未知}"
+    echo "加密: ${method:-未知}"
+    echo "TCP Fast Open: $tfo_text"
+    echo "模式: ${mode:-tcp_and_udp}"
+    echo "超时: ${timeout:-300} 秒"
+    echo "DNS: ${dns:-未设置}"
+
+    if [[ -n "$method" && -n "$password" && -n "$port" ]]; then
+        server_ip="$(get_public_ipv4)"
+        ss_uri="$(build_ss_uri "$method" "$password" "$server_ip" "$port")"
+        echo "服务器: $server_ip"
+        echo "完整 SS 链接: $ss_uri"
     fi
 }
 
