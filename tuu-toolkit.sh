@@ -3,11 +3,11 @@
 # TUU Toolkit 一键管理脚本
 # 项目地址: https://github.com/phyrevue/tuu-toolkit
 # 支持: Debian/Ubuntu, Alpine, CentOS/RHEL/Rocky/Alma
-# Version: 2.0.0
+# Version: 2.0.1
 
 set -o pipefail
 
-TOOL_VERSION="2.0.0"
+TOOL_VERSION="2.0.1"
 REPO_URL="https://github.com/phyrevue/tuu-toolkit"
 RAW_URL="https://raw.githubusercontent.com/phyrevue/tuu-toolkit/main/tuu-toolkit.sh"
 LOG_FILE="/var/log/tuu-toolkit.log"
