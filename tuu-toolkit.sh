@@ -367,6 +367,51 @@ random_password() {
     fi
 }
 
+base64_urlsafe_no_pad() {
+    printf '%s' "$1" | base64 | tr -d '\n=' | tr '+/' '-_'
+}
+
+get_public_ipv4() {
+    local ip url
+    if [[ -n "${SERVER_IP:-}" ]]; then
+        echo "$SERVER_IP"
+        return 0
+    fi
+
+    for url in "https://api.ipify.org" "https://ipv4.icanhazip.com" "https://ifconfig.me/ip"; do
+        if command -v curl >/dev/null 2>&1; then
+            ip="$(curl -fsS4 --connect-timeout 4 --max-time 8 "$url" 2>/dev/null | tr -d '[:space:]' || true)"
+        elif command -v wget >/dev/null 2>&1; then
+            ip="$(wget -qO- -T 8 "$url" 2>/dev/null | tr -d '[:space:]' || true)"
+        else
+            ip=""
+        fi
+
+        if [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+            echo "$ip"
+            return 0
+        fi
+    done
+
+    echo "YOUR_SERVER_IP"
+}
+
+build_ss_uri() {
+    local method="$1"
+    local password="$2"
+    local server="$3"
+    local port="$4"
+    local tag="${5:-TUU-SS-${port}}"
+    local userinfo
+
+    userinfo="$(base64_urlsafe_no_pad "${method}:${password}")"
+    if [[ "$server" == *:* && "$server" != \[*\] ]]; then
+        server="[$server]"
+    fi
+
+    echo "ss://${userinfo}@${server}:${port}#${tag}"
+}
+
 systemd_is_running() {
     [[ -d /run/systemd/system ]] && command -v systemctl >/dev/null 2>&1
 }
@@ -813,7 +858,7 @@ default_ss_password_bytes() {
 install_or_update_ss() {
     require_root
     init_context
-    local port method password fast_open dns suggested_port
+    local port method password fast_open dns suggested_port server_ip ss_uri
 
     suggested_port="$(random_port)"
     read -r -p "SS 端口 [默认 ${suggested_port}]: " port
@@ -846,9 +891,13 @@ install_or_update_ss() {
 
     echo
     log_success "Shadowsocks Rust 配置完成"
+    server_ip="$(get_public_ipv4)"
+    ss_uri="$(build_ss_uri "$method" "$password" "$server_ip" "$port")"
     echo "端口: $port"
     echo "密码: $password"
     echo "加密: $method"
+    echo "服务器: $server_ip"
+    echo "完整 SS 链接: $ss_uri"
 }
 
 show_ss_info() {
