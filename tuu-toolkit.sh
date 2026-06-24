@@ -3,13 +3,15 @@
 # TUU Toolkit 一键管理脚本
 # 项目地址: https://github.com/phyrevue/tuu-toolkit
 # 支持: Debian/Ubuntu, Alpine, CentOS/RHEL/Rocky/Alma
-# Version: 2.0.2
+# Version: 2.0.3
 
 set -o pipefail
 
-TOOL_VERSION="2.0.2"
+TOOL_VERSION="2.0.3"
 REPO_URL="https://github.com/phyrevue/tuu-toolkit"
 RAW_URL="https://raw.githubusercontent.com/phyrevue/tuu-toolkit/main/tuu-toolkit.sh"
+RELEASE_ASSET_URL_BASE="https://github.com/phyrevue/tuu-toolkit/releases/download"
+TOOL_INSTALL_PATH="/usr/local/bin/tuu-toolkit"
 LOG_FILE="/var/log/tuu-toolkit.log"
 
 GOST_DIR="/etc/gost"
@@ -255,6 +257,14 @@ install_archive_dependencies() {
     install_packages bash curl wget tar gzip ca-certificates sed grep procps openssl xz
 }
 
+ensure_download_tool() {
+    if command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1; then
+        return 0
+    fi
+    log_warn "缺少 curl/wget，正在安装下载工具"
+    install_packages curl wget ca-certificates
+}
+
 ensure_service_dependencies() {
     init_context
     if [[ "$SERVICE_MANAGER" == "openrc" ]]; then
@@ -295,6 +305,122 @@ get_latest_tag() {
         tag="$fallback"
     fi
     echo "$tag"
+}
+
+version_gt() {
+    local left="${1#v}"
+    local right="${2#v}"
+    local left_parts right_parts max i left_num right_num
+
+    IFS='.' read -r -a left_parts <<< "$left"
+    IFS='.' read -r -a right_parts <<< "$right"
+    max="${#left_parts[@]}"
+    (( ${#right_parts[@]} > max )) && max="${#right_parts[@]}"
+
+    for ((i = 0; i < max; i++)); do
+        left_num="${left_parts[$i]:-0}"
+        right_num="${right_parts[$i]:-0}"
+        left_num="${left_num//[^0-9]/}"
+        right_num="${right_num//[^0-9]/}"
+        left_num="${left_num:-0}"
+        right_num="${right_num:-0}"
+
+        if (( 10#$left_num > 10#$right_num )); then
+            return 0
+        elif (( 10#$left_num < 10#$right_num )); then
+            return 1
+        fi
+    done
+
+    return 1
+}
+
+current_script_path() {
+    local script_path="${BASH_SOURCE[0]:-$0}"
+    local resolved=""
+
+    if command -v readlink >/dev/null 2>&1; then
+        resolved="$(readlink -f "$script_path" 2>/dev/null || true)"
+    fi
+    [[ -z "$resolved" ]] && resolved="$script_path"
+
+    case "$resolved" in
+        /dev/fd/*|/proc/*/fd/*|pipe:*|"")
+            echo ""
+            ;;
+        *)
+            if [[ -f "$resolved" && -w "$resolved" ]]; then
+                echo "$resolved"
+            else
+                echo ""
+            fi
+            ;;
+    esac
+}
+
+get_latest_toolkit_tag() {
+    get_latest_tag "phyrevue/tuu-toolkit" "v${TOOL_VERSION}"
+}
+
+check_and_update_toolkit() {
+    require_root
+    init_context
+    ensure_download_tool || return 1
+
+    local latest_tag latest_version download_url tmp_file target current_path
+    latest_tag="$(get_latest_toolkit_tag)"
+    latest_version="${latest_tag#v}"
+
+    echo "当前版本: v${TOOL_VERSION}"
+    echo "最新版本: ${latest_tag}"
+
+    if ! version_gt "$latest_version" "$TOOL_VERSION"; then
+        log_success "当前已是最新版本"
+        return 0
+    fi
+
+    echo
+    log_info "发现新版本 ${latest_tag}"
+    if ! confirm "是否立即更新 TUU Toolkit?"; then
+        log_info "已取消更新"
+        return 0
+    fi
+
+    tmp_file="$(mktemp /tmp/tuu-toolkit-update.XXXXXX)"
+    download_url="${RELEASE_ASSET_URL_BASE}/${latest_tag}/tuu-toolkit.sh"
+    log_info "下载: $download_url"
+    if ! download_file "$download_url" "$tmp_file"; then
+        log_warn "Release 附件下载失败，尝试 main 分支脚本"
+        if ! download_file "$RAW_URL" "$tmp_file"; then
+            rm -f "$tmp_file"
+            log_error "更新脚本下载失败"
+            return 1
+        fi
+    fi
+
+    if ! bash -n "$tmp_file"; then
+        rm -f "$tmp_file"
+        log_error "下载的脚本语法检查失败，已中止更新"
+        return 1
+    fi
+
+    current_path="$(current_script_path)"
+    if [[ -n "$current_path" ]]; then
+        target="$current_path"
+    else
+        target="$TOOL_INSTALL_PATH"
+    fi
+
+    install -m 755 "$tmp_file" "$target"
+    rm -f "$tmp_file"
+
+    log_success "TUU Toolkit 已更新到 ${latest_tag}"
+    echo "安装位置: $target"
+    if [[ "$target" == "$TOOL_INSTALL_PATH" ]]; then
+        echo "以后可直接运行: tuu-toolkit"
+    else
+        echo "请重新运行脚本以使用新版本"
+    fi
 }
 
 gost_arch() {
@@ -1393,7 +1519,8 @@ main_menu() {
         echo "2) Shadowsocks Rust 管理"
         echo "3) Realm 转发管理"
         echo "4) 系统检测"
-        echo "5) 安装基础依赖"
+        echo "5) 检测/更新脚本"
+        echo "6) 安装基础依赖"
         echo "0) 退出"
         echo -e "${YELLOW}========================================${NC}"
         read -r -p "请选择: " choice
@@ -1402,7 +1529,8 @@ main_menu() {
             2) ss_menu ;;
             3) realm_menu ;;
             4) print_system_info; pause ;;
-            5) install_core_dependencies; pause ;;
+            5) check_and_update_toolkit; pause ;;
+            6) install_core_dependencies; pause ;;
             0) exit 0 ;;
             *) log_error "无效选项"; pause ;;
         esac
@@ -1418,6 +1546,10 @@ case "${1:-}" in
     --version|-v)
         echo "$TOOL_VERSION"
         ;;
+    --update)
+        need_bash
+        check_and_update_toolkit
+        ;;
     --help|-h)
         cat <<EOF
 TUU Toolkit ${TOOL_VERSION}
@@ -1426,11 +1558,13 @@ TUU Toolkit ${TOOL_VERSION}
   bash <(curl -fsSL ${RAW_URL})
   bash tuu-toolkit.sh
   bash tuu-toolkit.sh --check
+  bash tuu-toolkit.sh --update
 
 功能:
   - GOST SOCKS5 安装与服务管理
   - Shadowsocks Rust 安装与服务管理
   - Realm 安装、转发规则与服务管理
+  - 检测并更新 TUU Toolkit 脚本
 
 支持:
   Debian/Ubuntu + systemd
