@@ -1,15 +1,15 @@
 #!/bin/bash
 
-# Gost SOCKS5 一键部署脚本
-# 项目地址: https://github.com/phyrevue/gost-socks5
+# TUU Toolkit 一键部署脚本
+# 项目地址: https://github.com/phyrevue/tuu-toolkit
 # Gost官方: https://github.com/go-gost/gost
 # Version: 2.0.0
 # 
 # 使用方法:
-# bash <(curl -fsSL https://raw.githubusercontent.com/phyrevue/gost-socks5/main/gostsock5.sh)
+# bash <(curl -fsSL https://raw.githubusercontent.com/phyrevue/tuu-toolkit/main/tuu-toolkit.sh)
 # 
 # 或带参数:
-# PORT=8080 USE_AUTH=true USERNAME=admin PASSWORD=secret bash <(curl -fsSL https://raw.githubusercontent.com/phyrevue/gost-socks5/main/gostsock5.sh)
+# PORT=8080 USE_AUTH=true USERNAME=admin PASSWORD=secret bash <(curl -fsSL https://raw.githubusercontent.com/phyrevue/tuu-toolkit/main/tuu-toolkit.sh)
 
 set -e
 
@@ -468,7 +468,7 @@ EOF
 create_management_script() {
     log_info "创建管理脚本..."
     
-    cat > /usr/local/bin/gost-socks5 << 'EOF'
+    cat > /usr/local/bin/tuu-toolkit << 'EOF'
 #!/bin/bash
 
 # 颜色定义
@@ -480,9 +480,9 @@ NC='\033[0m'
 
 # 帮助信息
 show_help() {
-    echo "Gost SOCKS5 管理工具"
+    echo "TUU Toolkit 管理工具"
     echo ""
-    echo "用法: gost-socks5 [命令]"
+    echo "用法: tuu-toolkit [命令]"
     echo ""
     echo "命令:"
     echo "  start    - 启动服务"
@@ -550,7 +550,7 @@ update_gost() {
         read -r CONFIRM
         if [[ "$CONFIRM" =~ ^[Yy]$ ]]; then
             # 下载更新脚本并执行
-            bash <(curl -fsSL https://raw.githubusercontent.com/phyrevue/gost-socks5/main/gostsock5.sh)
+            bash <(curl -fsSL https://raw.githubusercontent.com/phyrevue/tuu-toolkit/main/tuu-toolkit.sh)
         fi
     fi
 }
@@ -593,9 +593,9 @@ case "$1" in
 esac
 EOF
     
-    chmod +x /usr/local/bin/gost-socks5
+    chmod +x /usr/local/bin/tuu-toolkit
     
-    log_success "管理脚本已创建: gost-socks5"
+    log_success "管理脚本已创建: tuu-toolkit"
 }
 
 # 配置防火墙
@@ -650,13 +650,13 @@ show_info() {
     
     echo ""
     echo -e "${BLUE}管理命令:${NC}"
-    echo -e "启动服务: gost-socks5 start"
-    echo -e "停止服务: gost-socks5 stop"
-    echo -e "重启服务: gost-socks5 restart"
-    echo -e "查看状态: gost-socks5 status"
-    echo -e "查看日志: gost-socks5 logs"
-    echo -e "测试代理: gost-socks5 test"
-    echo -e "更新版本: gost-socks5 update"
+    echo -e "启动服务: tuu-toolkit start"
+    echo -e "停止服务: tuu-toolkit stop"
+    echo -e "重启服务: tuu-toolkit restart"
+    echo -e "查看状态: tuu-toolkit status"
+    echo -e "查看日志: tuu-toolkit logs"
+    echo -e "测试代理: tuu-toolkit test"
+    echo -e "更新版本: tuu-toolkit update"
     echo ""
     echo -e "${BLUE}配置文件:${NC} /etc/gost/config.yaml"
     echo -e "${BLUE}日志文件:${NC} /var/log/gost/gost.log"
@@ -678,8 +678,8 @@ show_info() {
 # 主函数
 main() {
     clear
-    echo -e "${BLUE}Gost SOCKS5 一键部署脚本${NC}"
-    echo -e "${BLUE}项目地址: https://github.com/phyrevue/gost-socks5${NC}"
+    echo -e "${BLUE}TUU Toolkit 一键部署脚本${NC}"
+    echo -e "${BLUE}项目地址: https://github.com/phyrevue/tuu-toolkit${NC}"
     echo ""
     
     # 检查是否为 root
