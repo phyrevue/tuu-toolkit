@@ -2,6 +2,14 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
+## 一键安装
+
+root 权限下执行下面命令即可，无需下载文件，自动进入菜单：
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/phyrevue/tuu-toolkit/main/tuu-toolkit.sh)
+```
+
 TUU Toolkit 是一键管理代理服务的中文 Shell 脚本，支持安装、配置、管理以下三种代理：
 
 | 服务 | 类型 | TCP | UDP |
@@ -32,13 +40,7 @@ TUU Toolkit 是一键管理代理服务的中文 Shell 脚本，支持安装、�
 
 ## 安装与使用
 
-### 一键运行（无需下载）
-
-```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/phyrevue/tuu-toolkit/main/tuu-toolkit.sh)
-```
-
-或下载后本地运行：
+### 下载后本地运行
 
 ```bash
 wget https://raw.githubusercontent.com/phyrevue/tuu-toolkit/main/tuu-toolkit.sh -O tuu-toolkit.sh
