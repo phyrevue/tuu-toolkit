@@ -3,11 +3,11 @@
 # TUU Toolkit 一键管理脚本
 # 项目地址: https://github.com/phyrevue/tuu-toolkit
 # 支持: Debian/Ubuntu, Alpine, CentOS/RHEL/Rocky/Alma
-# Version: 2.0.3
+# Version: 2.0.4
 
 set -o pipefail
 
-TOOL_VERSION="2.0.3"
+TOOL_VERSION="2.0.4"
 REPO_URL="https://github.com/phyrevue/tuu-toolkit"
 RAW_URL="https://raw.githubusercontent.com/phyrevue/tuu-toolkit/main/tuu-toolkit.sh"
 RELEASE_ASSET_URL_BASE="https://github.com/phyrevue/tuu-toolkit/releases/download"
@@ -741,6 +741,9 @@ services:
     auth:
       username: "$(yaml_escape "$username")"
       password: "$(yaml_escape "$password")"
+    metadata:
+      udp: true
+      udpBufferSize: 4096
   listener:
     type: tcp
 
@@ -756,6 +759,9 @@ services:
   addr: "${bind_addr}:${port}"
   handler:
     type: socks5
+    metadata:
+      udp: true
+      udpBufferSize: 4096
   listener:
     type: tcp
 
@@ -848,6 +854,7 @@ install_or_update_gost() {
     write_gost_config "$port" "$bind_addr" "$use_auth" "$username" "$password" "$log_level"
     create_gost_service
     open_firewall_port "$port" tcp
+    open_firewall_port "$port" udp
     service_action "$GOST_SERVICE" restart || log_warn "服务未能自动重启，请在完整 init 环境中手动启动"
     log_success "GOST SOCKS5 配置完成"
 }
