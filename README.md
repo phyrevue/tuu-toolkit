@@ -4,11 +4,13 @@
 
 ## 一键安装
 
-root 权限下执行下面命令即可，无需下载文件，自动进入菜单：
+root 权限下执行下面命令，会将脚本保存到当前目录并自动进入菜单：
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/phyrevue/tuu-toolkit/main/tuu-toolkit.sh)
+curl -fsSL https://raw.githubusercontent.com/phyrevue/tuu-toolkit/main/tuu-toolkit.sh -o tuu-toolkit.sh && chmod +x tuu-toolkit.sh && ./tuu-toolkit.sh
 ```
+
+以后可在该目录直接执行 `./tuu-toolkit.sh` 再次进入工具箱。
 
 TUU Toolkit 是一键管理代理服务的中文 Shell 脚本，支持安装、配置、管理以下三种代理：
 
@@ -87,6 +89,9 @@ tuu-toolkit.sh --help     # 帮助
 
 ## 更新日志
 
+- **2.0.5**
+  - Shadowsocks Rust 优先安装静态 musl 构建，兼容旧版 glibc；安装前自动验证二进制是否可运行
+  - 一键运行命令会将 `tuu-toolkit.sh` 保存在当前目录，方便后续再次运行
 - **2.0.4**
   - GOST SOCKS5 开启 UDP 中继支持（`handler.metadata.udp: true`），并自动放行 UDP 防火墙端口；现在三种代理均默认支持 TCP + UDP
 - **2.0.3**

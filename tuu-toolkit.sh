@@ -3,11 +3,11 @@
 # TUU Toolkit 一键管理脚本
 # 项目地址: https://github.com/phyrevue/tuu-toolkit
 # 支持: Debian/Ubuntu, Alpine, CentOS/RHEL/Rocky/Alma
-# Version: 2.0.4
+# Version: 2.0.5
 
 set -o pipefail
 
-TOOL_VERSION="2.0.4"
+TOOL_VERSION="2.0.5"
 REPO_URL="https://github.com/phyrevue/tuu-toolkit"
 RAW_URL="https://raw.githubusercontent.com/phyrevue/tuu-toolkit/main/tuu-toolkit.sh"
 RELEASE_ASSET_URL_BASE="https://github.com/phyrevue/tuu-toolkit/releases/download"
@@ -896,13 +896,16 @@ uninstall_gost() {
 }
 
 ss_arch() {
-    linux_rust_target "$LIBC_KIND"
+    # Upstream GNU builds may require a newer glibc than the host provides.
+    # The musl release is static and works on both glibc and musl systems.
+    linux_rust_target "musl"
 }
 
 install_ss_binary() {
     install_archive_dependencies || return 1
     init_context
-    local tag version arch file url tmp
+    local tag version arch native_arch selected_arch file url tmp candidate
+    local candidates=()
     tag="$(get_latest_tag "shadowsocks/shadowsocks-rust" "v1.24.0")"
     version="${tag#v}"
     arch="$(ss_arch)"
@@ -910,25 +913,65 @@ install_ss_binary() {
         log_error "Shadowsocks Rust 不支持当前架构: $ARCH_RAW / $LIBC_KIND"
         return 1
     fi
-    file="shadowsocks-v${version}.${arch}.tar.xz"
-    url="https://github.com/shadowsocks/shadowsocks-rust/releases/download/v${version}/${file}"
+
+    candidates+=("$arch")
+    native_arch="$(linux_rust_target "$LIBC_KIND")"
+    if [[ -n "$native_arch" && "$native_arch" != "$arch" ]]; then
+        candidates+=("$native_arch")
+    fi
+
     tmp="$(mktemp -d /tmp/tuu-ss.XXXXXX)"
     mkdir -p "$SS_DIR"
-    log_info "下载 Shadowsocks Rust: $url"
-    if ! download_file "$url" "$tmp/$file"; then
+
+    for candidate in "${candidates[@]}"; do
+        file="shadowsocks-v${version}.${candidate}.tar.xz"
+        url="https://github.com/shadowsocks/shadowsocks-rust/releases/download/v${version}/${file}"
+        log_info "下载 Shadowsocks Rust: $url"
+        if download_file "$url" "$tmp/$file"; then
+            selected_arch="$candidate"
+            break
+        fi
+        log_warn "未找到 ${candidate} 发布包，尝试其他兼容构建"
+    done
+
+    if [[ -z "$selected_arch" ]]; then
+        rm -rf "$tmp"
+        log_error "Shadowsocks Rust 下载失败"
+        return 1
+    fi
+
+    if ! tar -xf "$tmp/$file" -C "$tmp"; then
+        log_error "Shadowsocks Rust 安装包解压失败"
         rm -rf "$tmp"
         return 1
     fi
-    tar -xf "$tmp/$file" -C "$tmp"
     if [[ ! -f "$tmp/ssserver" ]]; then
         log_error "解压后未找到 ssserver"
         rm -rf "$tmp"
         return 1
     fi
-    install -m 755 "$tmp/ssserver" "$SS_BIN"
-    echo "v${version}" > "$SS_VERSION_FILE"
+
+    chmod +x "$tmp/ssserver"
+    if ! "$tmp/ssserver" --version >/dev/null 2>"$tmp/ssserver-check.err"; then
+        log_error "下载的 ssserver 无法在当前系统运行"
+        if grep -q 'GLIBC_[0-9]' "$tmp/ssserver-check.err" 2>/dev/null; then
+            log_error "系统 glibc 版本过旧，请使用静态 musl 构建或升级操作系统"
+        fi
+        sed -n '1,10p' "$tmp/ssserver-check.err" >&2
+        rm -rf "$tmp"
+        return 1
+    fi
+
+    if ! install -m 755 "$tmp/ssserver" "$SS_BIN"; then
+        log_error "无法安装 ssserver 到 $SS_BIN"
+        rm -rf "$tmp"
+        return 1
+    fi
+    if ! echo "v${version}" > "$SS_VERSION_FILE"; then
+        log_warn "无法写入版本文件: $SS_VERSION_FILE"
+    fi
     rm -rf "$tmp"
-    log_success "Shadowsocks Rust v${version} 安装完成: $SS_BIN"
+    log_success "Shadowsocks Rust v${version} 安装完成 (${selected_arch}): $SS_BIN"
 }
 
 write_ss_config() {
@@ -1562,7 +1605,7 @@ case "${1:-}" in
 TUU Toolkit ${TOOL_VERSION}
 
 用法:
-  bash <(curl -fsSL ${RAW_URL})
+  curl -fsSL ${RAW_URL} -o tuu-toolkit.sh && chmod +x tuu-toolkit.sh && ./tuu-toolkit.sh
   bash tuu-toolkit.sh
   bash tuu-toolkit.sh --check
   bash tuu-toolkit.sh --update
