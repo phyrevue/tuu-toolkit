@@ -3,11 +3,11 @@
 # TUU Toolkit 一键管理脚本
 # 项目地址: https://github.com/phyrevue/tuu-toolkit
 # 支持: Debian/Ubuntu, Alpine, CentOS/RHEL/Rocky/Alma
-# Version: 2.0.5
+# Version: 2.0.6
 
 set -o pipefail
 
-TOOL_VERSION="2.0.5"
+TOOL_VERSION="2.0.6"
 REPO_URL="https://github.com/phyrevue/tuu-toolkit"
 RAW_URL="https://raw.githubusercontent.com/phyrevue/tuu-toolkit/main/tuu-toolkit.sh"
 RELEASE_ASSET_URL_BASE="https://github.com/phyrevue/tuu-toolkit/releases/download"
@@ -281,7 +281,7 @@ download_file() {
     if command -v curl >/dev/null 2>&1; then
         curl -fL --connect-timeout 20 --retry 2 -o "$output" "$url"
     elif command -v wget >/dev/null 2>&1; then
-        wget --no-check-certificate -O "$output" "$url"
+        wget -O "$output" "$url"
     else
         log_error "缺少 curl 或 wget"
         return 1
@@ -484,7 +484,7 @@ yaml_escape() {
 }
 
 valid_port() {
-    [[ "$1" =~ ^[0-9]+$ ]] && (( "$1" >= 1 && "$1" <= 65535 ))
+    [[ "$1" =~ ^[1-9][0-9]{0,4}$ ]] && (( $1 <= 65535 ))
 }
 
 random_port() {
@@ -507,6 +507,20 @@ random_password() {
 
 base64_urlsafe_no_pad() {
     printf '%s' "$1" | base64 | tr -d '\n=' | tr '+/' '-_'
+}
+
+url_encode() {
+    local LC_ALL=C
+    local input="$1"
+    local output="" char i
+    for ((i = 0; i < ${#input}; i++)); do
+        char="${input:i:1}"
+        case "$char" in
+            [A-Za-z0-9.~_-]) output+="$char" ;;
+            *) printf -v char '%%%02X' "'$char"; output+="$char" ;;
+        esac
+    done
+    printf '%s' "$output"
 }
 
 get_public_ipv4() {
@@ -542,7 +556,12 @@ build_ss_uri() {
     local tag="${5:-TUU-SS-${port}}"
     local userinfo
 
-    userinfo="$(base64_urlsafe_no_pad "${method}:${password}")"
+    # SIP002: 2022 加密的 userinfo 使用百分号编码，其余加密使用 Base64URL
+    if is_ss2022_method "$method"; then
+        userinfo="$(url_encode "$method"):$(url_encode "$password")"
+    else
+        userinfo="$(base64_urlsafe_no_pad "${method}:${password}")"
+    fi
     if [[ "$server" == *:* && "$server" != \[*\] ]]; then
         server="[$server]"
     fi
@@ -623,6 +642,45 @@ service_status_text() {
     fi
 }
 
+service_is_running() {
+    local service="$1"
+    if [[ "$SERVICE_MANAGER" == "systemd" ]]; then
+        systemd_is_running && systemctl is-active --quiet "$service"
+    elif [[ "$SERVICE_MANAGER" == "openrc" ]]; then
+        command -v rc-service >/dev/null 2>&1 && rc-service "$service" status >/dev/null 2>&1
+    else
+        return 1
+    fi
+}
+
+# 重启后稍等再检查，避免配置错误导致进程立即退出却仍提示成功
+# 返回: 0 运行中, 1 启动后退出, 2 当前环境无法管理服务
+restart_and_verify_service() {
+    local service="$1"
+    local error_log="${2:-}"
+    local log_lines_before=0
+    if [[ -n "$error_log" && -f "$error_log" ]]; then
+        log_lines_before="$(wc -l < "$error_log")"
+    fi
+    if ! service_action "$service" restart; then
+        log_warn "服务未能自动重启，请在完整 init 环境中手动启动"
+        return 2
+    fi
+    sleep 2
+    if service_is_running "$service"; then
+        return 0
+    fi
+
+    log_error "$service 启动后未能保持运行，最近日志:"
+    if [[ "$SERVICE_MANAGER" == "systemd" ]] && command -v journalctl >/dev/null 2>&1; then
+        journalctl -u "$service" -n 20 --no-pager >&2 2>/dev/null || true
+    elif [[ -n "$error_log" && -f "$error_log" ]]; then
+        # 错误日志是追加写入的，只显示本次重启后新增的内容
+        tail -n "+$((log_lines_before + 1))" "$error_log" | tail -n 20 >&2
+    fi
+    return 1
+}
+
 open_firewall_port() {
     local port="$1"
     local proto="${2:-tcp}"
@@ -699,6 +757,11 @@ command_background="yes"
 pidfile="/run/$1.pid"
 output_log="$output_log"
 error_log="$error_log"
+
+start_pre() {
+    # 容器内可能无权提高硬限制，失败时保持系统默认
+    ulimit -n 1048576 2>/dev/null || true
+}
 
 depend() {
     need net
@@ -855,7 +918,11 @@ install_or_update_gost() {
     create_gost_service
     open_firewall_port "$port" tcp
     open_firewall_port "$port" udp
-    service_action "$GOST_SERVICE" restart || log_warn "服务未能自动重启，请在完整 init 环境中手动启动"
+    restart_and_verify_service "$GOST_SERVICE" /var/log/gost/gost.err
+    if [[ $? -eq 1 ]]; then
+        log_error "GOST 服务未能正常运行，请根据上面的日志排查"
+        return 1
+    fi
     log_success "GOST SOCKS5 配置完成"
 }
 
@@ -974,6 +1041,15 @@ install_ss_binary() {
     log_success "Shadowsocks Rust v${version} 安装完成 (${selected_arch}): $SS_BIN"
 }
 
+# 内核禁用 IPv6 时无法绑定 "::"，退回仅 IPv4 监听
+ss_listen_addr() {
+    if [[ -e /proc/net/if_inet6 ]]; then
+        echo "::"
+    else
+        echo "0.0.0.0"
+    fi
+}
+
 write_ss_config() {
     local port="$1"
     local password="$2"
@@ -992,7 +1068,7 @@ write_ss_config() {
     fi
     {
         printf '{\n'
-        printf '    "server": "::",\n'
+        printf '    "server": "%s",\n' "$(ss_listen_addr)"
         printf '    "server_port": %s,\n' "$port"
         printf '    "password": "%s",\n' "$password_json"
         printf '    "method": "%s",\n' "$method_json"
@@ -1020,19 +1096,23 @@ create_ss_service() {
 choose_ss_method() {
     local choice method
     echo "请选择 Shadowsocks 加密方式:" >&2
-    echo "1) 2022-blake3-aes-256-gcm (默认)" >&2
-    echo "2) 2022-blake3-chacha20-poly1305" >&2
-    echo "3) aes-256-gcm" >&2
-    echo "4) chacha20-ietf-poly1305" >&2
+    echo "1) aes-256-gcm (默认，兼容性最好)" >&2
+    echo "2) chacha20-ietf-poly1305" >&2
+    echo "3) 2022-blake3-aes-256-gcm (要求服务器与客户端时间误差小于 30 秒)" >&2
+    echo "4) 2022-blake3-chacha20-poly1305 (要求服务器与客户端时间误差小于 30 秒)" >&2
     read -r -p "选项 [1-4]: " choice
     case "${choice:-1}" in
-        1) method="2022-blake3-aes-256-gcm" ;;
-        2) method="2022-blake3-chacha20-poly1305" ;;
-        3) method="aes-256-gcm" ;;
-        4) method="chacha20-ietf-poly1305" ;;
-        *) method="2022-blake3-aes-256-gcm" ;;
+        1) method="aes-256-gcm" ;;
+        2) method="chacha20-ietf-poly1305" ;;
+        3) method="2022-blake3-aes-256-gcm" ;;
+        4) method="2022-blake3-chacha20-poly1305" ;;
+        *) method="aes-256-gcm" ;;
     esac
     echo "$method"
+}
+
+is_ss2022_method() {
+    [[ "$1" == 2022-blake3-* ]]
 }
 
 default_ss_password_bytes() {
@@ -1043,10 +1123,53 @@ default_ss_password_bytes() {
     esac
 }
 
+# 2022 加密的密码必须是指定长度密钥的 Base64，否则 ssserver 会拒绝启动
+valid_ss2022_password() {
+    local method="$1"
+    local password="$2"
+    local expected decoded_len
+    [[ "$password" =~ ^[A-Za-z0-9+/]+=*$ ]] || return 1
+    expected="$(default_ss_password_bytes "$method")"
+    decoded_len="$(printf '%s' "$password" | base64 -d 2>/dev/null | wc -c)"
+    [[ "${decoded_len//[[:space:]]/}" == "$expected" ]]
+}
+
+print_ss_connect_hints() {
+    local method="$1"
+    echo
+    echo "如果客户端无法连接，请检查:"
+    echo "  - 云服务商控制台的安全组是否已放行该端口的 TCP 和 UDP"
+    if is_ss2022_method "$method"; then
+        echo "  - 服务器与客户端时间误差是否小于 30 秒 (服务器当前 UTC 时间: $(date -u '+%H:%M:%S'))"
+    fi
+}
+
+# 仅更新程序与服务文件，保留现有端口、密码和加密方式，分享链接不变
+update_ss_keep_config() {
+    install_ss_binary || return 1
+    create_ss_service
+    restart_and_verify_service "$SS_SERVICE" /var/log/ss-rust.err
+    if [[ $? -eq 1 ]]; then
+        log_error "Shadowsocks 服务未能正常运行，请根据上面的日志排查"
+        return 1
+    fi
+    echo
+    log_success "Shadowsocks Rust 已更新，原配置保持不变"
+    show_ss_info
+}
+
 install_or_update_ss() {
     require_root
     init_context
-    local port method password fast_open dns suggested_port server_ip ss_uri
+    local port method password fast_open dns suggested_port server_ip ss_uri keep_answer
+
+    if [[ -f "$SS_CONFIG" ]]; then
+        read -r -p "检测到已有配置，是否保留配置仅更新程序? [Y/n]: " keep_answer
+        if [[ ! "$keep_answer" =~ ^[Nn]$ ]]; then
+            update_ss_keep_config
+            return
+        fi
+    fi
 
     suggested_port="$(random_port)"
     read -r -p "SS 端口 [默认 ${suggested_port}]: " port
@@ -1057,9 +1180,15 @@ install_or_update_ss() {
     fi
 
     method="$(choose_ss_method)"
+    if is_ss2022_method "$method"; then
+        log_warn "2022 加密会校验时间，服务器或客户端时间不准时将无法连接"
+    fi
     read -r -p "SS 密码 [默认自动生成]: " password
     if [[ -z "$password" ]]; then
         password="$(random_password "$(default_ss_password_bytes "$method")")"
+    elif is_ss2022_method "$method" && ! valid_ss2022_password "$method" "$password"; then
+        log_error "${method} 的密码必须是 $(default_ss_password_bytes "$method") 字节密钥的 Base64 编码，建议留空自动生成"
+        return 1
     fi
 
     read -r -p "是否开启 TCP Fast Open? [y/N]: " fast_open
@@ -1075,7 +1204,11 @@ install_or_update_ss() {
     create_ss_service
     open_firewall_port "$port" tcp
     open_firewall_port "$port" udp
-    service_action "$SS_SERVICE" restart || log_warn "服务未能自动重启，请在完整 init 环境中手动启动"
+    restart_and_verify_service "$SS_SERVICE" /var/log/ss-rust.err
+    if [[ $? -eq 1 ]]; then
+        log_error "Shadowsocks 服务未能正常运行，请根据上面的日志排查"
+        return 1
+    fi
 
     echo
     log_success "Shadowsocks Rust 配置完成"
@@ -1086,6 +1219,7 @@ install_or_update_ss() {
     echo "加密: $method"
     echo "服务器: $server_ip"
     echo "完整 SS 链接: $ss_uri"
+    print_ss_connect_hints "$method"
 }
 
 show_ss_info() {

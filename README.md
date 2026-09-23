@@ -25,10 +25,10 @@ TUU Toolkit 是一键管理代理服务的中文 Shell 脚本，支持安装、�
 ## 功能特性
 
 - **GOST SOCKS5**：带/不带用户名密码认证，自动安装最新版并创建 systemd / OpenRC 服务
-- **Shadowsocks Rust**：支持 `2022-blake3` 等 AEAD 加密方法，自动生成分享链接
+- **Shadowsocks Rust**：默认 `aes-256-gcm`（不依赖时间同步，兼容性最好），可选 `2022-blake3` 系列；自动生成分享链接，更新时可保留原配置
 - **Realm**：添加 / 删除 / 查看 TCP+UDP 端口转发规则，支持自定义监听地址与规则备注，可设置每日自动重启
 - 自动检测发行版（Debian/Ubuntu、Alpine、CentOS/RHEL/Rocky/Alma）与系统服务管理器（systemd / OpenRC）
-- 自动放行防火墙端口（支持 firewalld、ufw、iptables、nftables 等）
+- 自动放行防火墙端口（支持 firewalld、ufw、iptables）；云服务商安全组需在控制台手动放行
 - 自带脚本自检与在线更新功能
 
 ## 系统要求
@@ -68,9 +68,9 @@ tuu-toolkit.sh --help     # 帮助
 │ 1. GOST SOCKS5               │
 │ 2. Shadowsocks Rust          │
 │ 3. Realm                     │
-│ 4. 安装核心依赖              │
-│ 5. 检测系统信息              │
-│ 6. 检查更新                  │
+│ 4. 系统检测                  │
+│ 5. 检测/更新脚本             │
+│ 6. 安装基础依赖              │
 │ 0. 退出                      │
 └──────────────────────────────┘
 ```
@@ -89,6 +89,13 @@ tuu-toolkit.sh --help     # 帮助
 
 ## 更新日志
 
+- **2.0.6**
+  - Shadowsocks 默认加密改为 `aes-256-gcm`；选择 `2022-blake3` 加密时提示时间同步要求，并校验自定义密码格式
+  - 安装/更新后检查服务是否真正运行，启动失败时直接显示日志，不再误报成功
+  - 已有 SS 配置时可仅更新程序，保留端口、密码和分享链接
+  - 系统禁用 IPv6 时 SS 自动改为监听 `0.0.0.0`
+  - 2022 加密的分享链接改为 SIP002 规定的百分号编码格式，兼容严格按规范解析的客户端
+  - OpenRC 服务文件句柄上限与 systemd 保持一致；wget 下载不再跳过证书校验；端口输入拒绝前导零
 - **2.0.5**
   - Shadowsocks Rust 优先安装静态 musl 构建，兼容旧版 glibc；安装前自动验证二进制是否可运行
   - 一键运行命令会将 `tuu-toolkit.sh` 保存在当前目录，方便后续再次运行
