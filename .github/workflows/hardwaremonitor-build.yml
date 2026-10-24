@@ -1,0 +1,67 @@
+name: HardwareMonitor custom Windows build
+on:
+  push:
+    paths:
+      - "hardwaremonitor-build/**"
+      - ".github/workflows/hardwaremonitor-build.yml"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-2022
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout patch
+        uses: actions/checkout@v4
+        with:
+          path: patchrepo
+      - name: Checkout official source
+        uses: actions/checkout@v4
+        with:
+          repository: zhongyang219/TrafficMonitorPlugins
+          ref: eb7fc9e56f93fb69c99b185c6b8c395153d78bc6
+          path: upstream
+      - name: Unpack patch
+        shell: pwsh
+        run: |
+          $base64 = (Get-Content 'patchrepo/hardwaremonitor-build/patch.b64' -Raw).Trim()
+          $compressed = [Convert]::FromBase64String($base64)
+          $stream = [System.IO.MemoryStream]::new($compressed)
+          $gzip = [System.IO.Compression.GZipStream]::new($stream, [System.IO.Compression.CompressionMode]::Decompress)
+          $target = [System.IO.File]::Create('apply_patch.py')
+          $gzip.CopyTo($target)
+          $target.Dispose()
+          $gzip.Dispose()
+          $stream.Dispose()
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Patch source
+        shell: pwsh
+        run: python apply_patch.py upstream
+      - name: Build Windows x64 C++/CLI
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $vsPath = & $vswhere -latest -products '*' -requires Microsoft.Component.MSBuild Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vsPath) { throw 'Visual Studio MSVC not found' }
+          $msbuild = Join-Path $vsPath 'MSBuild\Current\Bin\MSBuild.exe'
+          $root = (Resolve-Path 'upstream').Path
+          $props = @('/nologo','/m:1','/v:minimal','/t:Rebuild','/p:Configuration=Release','/p:Platform=x64',"/p:SolutionDir=$root\")
+          & $msbuild (Join-Path $root 'utilities\utilities.vcxproj') @props
+          if ($LASTEXITCODE -ne 0) { throw 'utilities build failed' }
+          & $msbuild (Join-Path $root 'Plugins\HardwareMonitor\HardwareMonitor.vcxproj') @props
+          if ($LASTEXITCODE -ne 0) { throw 'HardwareMonitor build failed' }
+          $dll = Join-Path $root 'Bin\x64\Release\HardwareMonitor.dll'
+          if (-not (Test-Path $dll)) { throw 'DLL not found' }
+          New-Item -ItemType Directory -Force -Path 'output' | Out-Null
+          Copy-Item $dll 'output\HardwareMonitor.dll'
+      - name: Upload DLL
+        uses: actions/upload-artifact@v4
+        with:
+          name: HardwareMonitor-Rename-BatteryETA-x64
+          path: output/HardwareMonitor.dll
+          if-no-files-found: error
