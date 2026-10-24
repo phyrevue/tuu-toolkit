@@ -41,6 +41,17 @@ jobs:
       - name: Patch source
         shell: pwsh
         run: python apply_patch.py upstream
+      - name: Fix C++/CLI WinForms type shadowing
+        shell: pwsh
+        run: |
+          $p = 'upstream/Plugins/HardwareMonitor/SettingsForm.cpp'
+          $s = [System.IO.File]::ReadAllText($p)
+          $s = $s.Replace('gcnew ContextMenuStrip()', 'gcnew System::Windows::Forms::ContextMenuStrip()')
+          $s = $s.Replace('MouseButtons::Right', 'System::Windows::Forms::MouseButtons::Right')
+          $s = $s.Replace('FormBorderStyle::FixedDialog', 'System::Windows::Forms::FormBorderStyle::FixedDialog')
+          $s = $s.Replace('DialogResult::OK', 'System::Windows::Forms::DialogResult::OK')
+          $s = $s.Replace('DialogResult::Cancel', 'System::Windows::Forms::DialogResult::Cancel')
+          [System.IO.File]::WriteAllText($p, $s)
       - name: Build Windows x64 C++/CLI
         shell: pwsh
         run: |
