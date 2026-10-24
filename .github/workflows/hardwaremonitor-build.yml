@@ -52,7 +52,7 @@ jobs:
           $s = $s.Replace('DialogResult::OK', 'System::Windows::Forms::DialogResult::OK')
           $s = $s.Replace('DialogResult::Cancel', 'System::Windows::Forms::DialogResult::Cancel')
           $s = $s.Replace('System::Windows::Forms::System::Windows::Forms::DialogResult', 'System::Windows::Forms::DialogResult')
-          [System.IO.File]::WriteAllText($p, $s)
+          [System.IO.File]::WriteAllText($p, $s, [System.Text.UTF8Encoding]::new($true))
       - name: Build Windows x64 C++/CLI
         shell: pwsh
         run: |
