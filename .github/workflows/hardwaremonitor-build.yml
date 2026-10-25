@@ -56,6 +56,20 @@ jobs:
       - name: Add rolling average power and configurable ETA mode
         shell: pwsh
         run: python patchrepo/hardwaremonitor-build/add_average_power.py upstream
+      - name: Apply tested lightweight UX patch
+        shell: pwsh
+        run: |
+          $raw = (Get-Content 'patchrepo/hardwaremonitor-build/add_ux.b64' -Raw).Trim()
+          $bytes = [Convert]::FromBase64String($raw)
+          $inputStream = [System.IO.MemoryStream]::new($bytes)
+          $gzip = [System.IO.Compression.GZipStream]::new($inputStream, [System.IO.Compression.CompressionMode]::Decompress)
+          $output = [System.IO.File]::Create('add_ux.py')
+          $gzip.CopyTo($output)
+          $output.Dispose()
+          $gzip.Dispose()
+          $inputStream.Dispose()
+          python add_ux.py upstream --check
+          python add_ux.py upstream
       - name: Build Windows x64 C++/CLI
         shell: pwsh
         run: |
@@ -77,6 +91,6 @@ jobs:
       - name: Upload DLL
         uses: actions/upload-artifact@v4
         with:
-          name: HardwareMonitor-AveragePower-ETA-x64
+          name: HardwareMonitor-LightweightUX-x64
           path: output/HardwareMonitor.dll
           if-no-files-found: error
