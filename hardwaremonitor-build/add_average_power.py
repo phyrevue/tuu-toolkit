@@ -332,55 +332,110 @@ SETTINGS_METHODS=r'''
         dialog->MaximizeBox = false;
         dialog->MinimizeBox = false;
         dialog->ShowInTaskbar = false;
-        dialog->ClientSize = System::Drawing::Size(450, 226);
+        dialog->Font = this->Font;
+        dialog->AutoScaleMode = System::Windows::Forms::AutoScaleMode::Font;
+        dialog->ClientSize = System::Drawing::Size(500, 290);
+
+        // Single-column layout: the numeric control never overlaps the description.
+        // AutoSize rows and font-based scaling keep all text visible at high DPI.
+        System::Windows::Forms::TableLayoutPanel^ layout =
+            gcnew System::Windows::Forms::TableLayoutPanel();
+        layout->Dock = System::Windows::Forms::DockStyle::Fill;
+        layout->Padding = System::Windows::Forms::Padding(20, 16, 20, 16);
+        layout->ColumnCount = 1;
+        layout->RowCount = 7;
+        layout->ColumnStyles->Add(gcnew System::Windows::Forms::ColumnStyle(
+            System::Windows::Forms::SizeType::Percent, 100.0f));
+        for (int i = 0; i < 7; ++i)
+        {
+            if (i == 5)
+                layout->RowStyles->Add(gcnew System::Windows::Forms::RowStyle(
+                    System::Windows::Forms::SizeType::Percent, 100.0f));
+            else
+                layout->RowStyles->Add(gcnew System::Windows::Forms::RowStyle(
+                    System::Windows::Forms::SizeType::AutoSize));
+        }
 
         System::Windows::Forms::Label^ windowLabel = gcnew System::Windows::Forms::Label();
-        windowLabel->Text = L"平均功耗统计窗口（分钟，1 至 120）：";
+        windowLabel->Text = L"平均功耗统计窗口：";
         windowLabel->AutoSize = true;
-        windowLabel->Location = System::Drawing::Point(14, 18);
+        windowLabel->Margin = System::Windows::Forms::Padding(0, 0, 0, 8);
 
-        System::Windows::Forms::NumericUpDown^ windowBox = gcnew System::Windows::Forms::NumericUpDown();
+        System::Windows::Forms::NumericUpDown^ windowBox =
+            gcnew System::Windows::Forms::NumericUpDown();
         windowBox->Minimum = System::Decimal(1);
         windowBox->Maximum = System::Decimal(120);
         windowBox->Value = System::Decimal(settings.battery_average_minutes);
-        windowBox->Location = System::Drawing::Point(324, 15);
-        windowBox->Size = System::Drawing::Size(105, 26);
+        windowBox->Size = System::Drawing::Size(110, 29);
+        windowBox->Margin = System::Windows::Forms::Padding(0, 0, 10, 0);
+
+        System::Windows::Forms::Label^ minutesLabel = gcnew System::Windows::Forms::Label();
+        minutesLabel->Text = L"分钟（可设置 1 至 120）";
+        minutesLabel->AutoSize = true;
+        minutesLabel->Margin = System::Windows::Forms::Padding(0, 5, 0, 0);
+
+        System::Windows::Forms::FlowLayoutPanel^ windowRow =
+            gcnew System::Windows::Forms::FlowLayoutPanel();
+        windowRow->AutoSize = true;
+        windowRow->AutoSizeMode = System::Windows::Forms::AutoSizeMode::GrowAndShrink;
+        windowRow->FlowDirection = System::Windows::Forms::FlowDirection::LeftToRight;
+        windowRow->WrapContents = true;
+        windowRow->Dock = System::Windows::Forms::DockStyle::Fill;
+        windowRow->Margin = System::Windows::Forms::Padding(0, 0, 0, 20);
+        windowRow->Controls->Add(windowBox);
+        windowRow->Controls->Add(minutesLabel);
 
         System::Windows::Forms::Label^ modeLabel = gcnew System::Windows::Forms::Label();
         modeLabel->Text = L"电池剩余时间的计算依据：";
         modeLabel->AutoSize = true;
-        modeLabel->Location = System::Drawing::Point(14, 65);
+        modeLabel->Margin = System::Windows::Forms::Padding(0, 0, 0, 10);
 
-        System::Windows::Forms::RadioButton^ liveRadio = gcnew System::Windows::Forms::RadioButton();
+        System::Windows::Forms::RadioButton^ liveRadio =
+            gcnew System::Windows::Forms::RadioButton();
         liveRadio->Text = L"实时放电功率（当前值）";
         liveRadio->AutoSize = true;
-        liveRadio->Location = System::Drawing::Point(28, 94);
+        liveRadio->Margin = System::Windows::Forms::Padding(10, 0, 0, 10);
         liveRadio->Checked = !settings.battery_eta_use_average;
 
-        System::Windows::Forms::RadioButton^ averageRadio = gcnew System::Windows::Forms::RadioButton();
+        System::Windows::Forms::RadioButton^ averageRadio =
+            gcnew System::Windows::Forms::RadioButton();
         averageRadio->Text = L"过去指定分钟的平均放电功率";
         averageRadio->AutoSize = true;
-        averageRadio->Location = System::Drawing::Point(28, 121);
+        averageRadio->Margin = System::Windows::Forms::Padding(10, 0, 0, 10);
         averageRadio->Checked = settings.battery_eta_use_average;
 
         System::Windows::Forms::Button^ ok = gcnew System::Windows::Forms::Button();
         ok->Text = L"确定";
-        ok->Location = System::Drawing::Point(256, 177);
-        ok->Size = System::Drawing::Size(80, 28);
+        ok->AutoSize = true;
+        ok->AutoSizeMode = System::Windows::Forms::AutoSizeMode::GrowOnly;
+        ok->Size = System::Drawing::Size(90, 32);
         ok->DialogResult = System::Windows::Forms::DialogResult::OK;
+
         System::Windows::Forms::Button^ cancel = gcnew System::Windows::Forms::Button();
         cancel->Text = L"取消";
-        cancel->Location = System::Drawing::Point(349, 177);
-        cancel->Size = System::Drawing::Size(80, 28);
+        cancel->AutoSize = true;
+        cancel->AutoSizeMode = System::Windows::Forms::AutoSizeMode::GrowOnly;
+        cancel->Size = System::Drawing::Size(90, 32);
         cancel->DialogResult = System::Windows::Forms::DialogResult::Cancel;
 
-        dialog->Controls->Add(windowLabel);
-        dialog->Controls->Add(windowBox);
-        dialog->Controls->Add(modeLabel);
-        dialog->Controls->Add(liveRadio);
-        dialog->Controls->Add(averageRadio);
-        dialog->Controls->Add(ok);
-        dialog->Controls->Add(cancel);
+        System::Windows::Forms::FlowLayoutPanel^ buttons =
+            gcnew System::Windows::Forms::FlowLayoutPanel();
+        buttons->AutoSize = true;
+        buttons->AutoSizeMode = System::Windows::Forms::AutoSizeMode::GrowAndShrink;
+        buttons->Dock = System::Windows::Forms::DockStyle::Fill;
+        buttons->WrapContents = false;
+        buttons->FlowDirection = System::Windows::Forms::FlowDirection::RightToLeft;
+        buttons->Margin = System::Windows::Forms::Padding(0, 10, 0, 0);
+        buttons->Controls->Add(cancel);
+        buttons->Controls->Add(ok);
+
+        layout->Controls->Add(windowLabel, 0, 0);
+        layout->Controls->Add(windowRow, 0, 1);
+        layout->Controls->Add(modeLabel, 0, 2);
+        layout->Controls->Add(liveRadio, 0, 3);
+        layout->Controls->Add(averageRadio, 0, 4);
+        layout->Controls->Add(buttons, 0, 6);
+        dialog->Controls->Add(layout);
         dialog->AcceptButton = ok;
         dialog->CancelButton = cancel;
         if (dialog->ShowDialog(this) == System::Windows::Forms::DialogResult::OK)
