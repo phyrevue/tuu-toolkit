@@ -437,7 +437,9 @@ fetch_latest_toolkit() {
     echo "$version"
 }
 
+# 参数 restart: 更新成功后直接切换到新版本运行（菜单中使用）
 check_and_update_toolkit() {
+    local restart_after="${1:-}"
     require_root
     init_context
     ensure_download_tool || return 1
@@ -490,12 +492,17 @@ check_and_update_toolkit() {
     rm -f "$tmp_file"
 
     log_success "TUU Toolkit 已更新到 v${latest_version}"
+    write_log "TUU Toolkit updated: v${TOOL_VERSION} -> v${latest_version} ($target)"
     echo "安装位置: $target"
-    if [[ "$target" == "$TOOL_INSTALL_PATH" ]]; then
-        echo "以后可直接运行: tuu-toolkit"
-    else
-        echo "请重新运行脚本以使用新版本"
+    [[ "$target" == "$TOOL_INSTALL_PATH" ]] && echo "以后可直接运行: tuu-toolkit"
+
+    # 正在运行的仍是内存中的旧版本，菜单模式下直接切换到新脚本
+    if [[ "$restart_after" == "restart" ]]; then
+        pause
+        log_info "正在启动新版本 v${latest_version}..."
+        exec bash "$target"
     fi
+    echo "请重新运行脚本以使用新版本"
 }
 
 gost_arch() {
@@ -2374,7 +2381,7 @@ main_menu() {
             2) ss_menu ;;
             3) realm_menu ;;
             4) print_system_info; pause ;;
-            5) check_and_update_toolkit; pause ;;
+            5) check_and_update_toolkit restart; pause ;;
             6) install_core_dependencies; pause ;;
             7) log_menu ;;
             0) exit 0 ;;
