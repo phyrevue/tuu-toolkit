@@ -56,6 +56,8 @@ chmod +x tuu-toolkit.sh
 tuu-toolkit.sh --check    # 检测系统信息
 tuu-toolkit.sh --version  # 查看版本
 tuu-toolkit.sh --update   # 在线更新脚本
+tuu-toolkit.sh --diagnose # 生成排错报告
+tuu-toolkit.sh --log      # 查看脚本错误日志
 tuu-toolkit.sh --help     # 帮助
 ```
 
@@ -71,6 +73,7 @@ tuu-toolkit.sh --help     # 帮助
 │ 4. 系统检测                  │
 │ 5. 检测/更新脚本             │
 │ 6. 安装基础依赖              │
+│ 7. 日志与排错                │
 │ 0. 退出                      │
 └──────────────────────────────┘
 ```
@@ -87,9 +90,31 @@ tuu-toolkit.sh --help     # 帮助
 
 > 修改脚本重新安装不会自动改写已存在的旧配置；若需让已安装服务生效，请在其子菜单中重新执行“安装/更新”，或手动修改上述配置文件后重启对应服务。
 
+## 日志与排错
+
+遇到服务无法启动、转发不通等问题时，先在主菜单选择 `7) 日志与排错 -> 生成排错报告`，或执行 `./tuu-toolkit.sh --diagnose`。
+
+- 报告开头是**问题摘要**，会自动检查：主程序能否运行（glibc / 架构不兼容）、配置和服务文件是否存在、服务是否运行或崩溃、端口是否监听或被占用、Realm 是否有规则及目标是否可达、OpenRC / systemd 状态、DNS 与 GitHub 连通性、磁盘空间等
+- 后面附有系统信息、服务状态、配置内容、各服务错误日志、监听端口、防火墙规则和脚本日志
+- 报告保存在 `/var/log/tuu-toolkit-diagnose/`，保留最近 10 份；**密码和 `ss://` 链接已脱敏**，但包含 IP 和端口，分享前请自行确认
+
+脚本日志 `/var/log/tuu-toolkit.log` 会记录每次操作、所有警告和错误（含出错位置），以及失败命令（包管理器、下载、服务启停）的退出码和输出，超过 2MB 时自动截断。
+
+| 日志 | 位置 |
+| ---- | ---- |
+| 脚本日志 | `/var/log/tuu-toolkit.log` |
+| GOST | `/var/log/gost/gost.log`、`/var/log/gost/gost.err` |
+| Shadowsocks Rust | `/var/log/ss-rust.log`、`/var/log/ss-rust.err` |
+| Realm | `/var/log/realm.log`、`/var/log/realm.err` |
+
+> systemd 系统上服务输出也可用 `journalctl -u <服务名>` 查看。
+
 ## 更新日志
 
 - **2.0.6**
+  - 新增「日志与排错」菜单与 `--diagnose` / `--log` 参数：一键生成带问题摘要的排错报告，脚本日志记录错误位置和失败命令输出
+  - 修复 OpenRC 下服务进程退出后提示 `already been started` 而无法启动的问题；Realm 无转发规则时不再启动
+  - 修复脚本更新检测读取过期 Release 版本的问题，改为以 main 分支脚本版本为准
   - Shadowsocks 默认加密改为 `aes-256-gcm`；选择 `2022-blake3` 加密时提示时间同步要求，并校验自定义密码格式
   - 安装/更新后检查服务是否真正运行，启动失败时直接显示日志，不再误报成功
   - 已有 SS 配置时可仅更新程序，保留端口、密码和分享链接

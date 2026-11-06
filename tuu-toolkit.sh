@@ -46,10 +46,66 @@ SERVICE_MANAGER=""
 LIBC_KIND=""
 ARCH_RAW=""
 
+LOG_MAX_BYTES=2097152
+LOG_KEEP_LINES=5000
+DIAG_DIR="/var/log/tuu-toolkit-diagnose"
+
+# 写入脚本日志: log_to_file LEVEL 消息...
+log_to_file() {
+    local level="$1"
+    shift
+    mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
+    printf '[%s] [%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$level" "$*" \
+        | sed 's/\x1b\[[0-9;]*m//g' 2>/dev/null >> "$LOG_FILE" || true
+}
+
+# 调用链，例如 realm_start_service <- realm_menu <- main_menu
+log_caller_chain() {
+    local skip="${1:-2}"
+    local chain="" i
+    for ((i = skip; i < ${#FUNCNAME[@]}; i++)); do
+        [[ "${FUNCNAME[$i]}" == "main" ]] && break
+        chain+="${chain:+ <- }${FUNCNAME[$i]}"
+    done
+    echo "${chain:-main}"
+}
+
 log_info() { echo -e "${BLUE}[INFO]${NC} $*"; }
 log_success() { echo -e "${GREEN}[SUCCESS]${NC} $*"; }
-log_warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
-log_error() { echo -e "${RED}[ERROR]${NC} $*" >&2; }
+log_warn() {
+    echo -e "${YELLOW}[WARN]${NC} $*"
+    log_to_file WARN "$* (位置: $(log_caller_chain 2))"
+}
+log_error() {
+    echo -e "${RED}[ERROR]${NC} $*" >&2
+    log_to_file ERROR "$* (位置: $(log_caller_chain 2))"
+}
+
+# 运行命令，输出照常显示；失败时把命令、退出码和最后 30 行输出记入脚本日志
+run_logged() {
+    local out rc
+    out="$(mktemp /tmp/tuu-cmd.XXXXXX 2>/dev/null)" || { "$@"; return $?; }
+    "$@" 2>&1 | tee "$out"
+    rc="${PIPESTATUS[0]}"
+    if (( rc != 0 )); then
+        log_to_file ERROR "命令失败 (退出码 $rc): $* (位置: $(log_caller_chain 2))"
+        tr '\r' '\n' < "$out" | grep -v '^[[:space:]]*$' | tail -n 30 | sed 's/^/    | /' \
+            | sed 's/\x1b\[[0-9;]*m//g' 2>/dev/null >> "$LOG_FILE" || true
+    fi
+    rm -f "$out"
+    return "$rc"
+}
+
+rotate_log_file() {
+    local size tmp
+    [[ -f "$LOG_FILE" ]] || return 0
+    size="$(wc -c < "$LOG_FILE" 2>/dev/null || echo 0)"
+    if (( size > LOG_MAX_BYTES )); then
+        tmp="$(mktemp /tmp/tuu-log.XXXXXX 2>/dev/null)" || return 0
+        tail -n "$LOG_KEEP_LINES" "$LOG_FILE" > "$tmp" && cat "$tmp" > "$LOG_FILE"
+        rm -f "$tmp"
+    fi
+}
 
 clear_screen() {
     if [[ -t 1 && -n "${TERM:-}" ]] && command -v clear >/dev/null 2>&1; then
@@ -60,8 +116,7 @@ clear_screen() {
 }
 
 write_log() {
-    mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG_FILE" 2>/dev/null || true
+    log_to_file INFO "$*"
 }
 
 pause() {
@@ -229,18 +284,18 @@ install_packages() {
     log_info "安装依赖: ${packages[*]}"
     case "$PKG_MANAGER" in
         apt-get)
-            apt-get update
-            DEBIAN_FRONTEND=noninteractive apt-get install -y "${packages[@]}"
+            run_logged apt-get update
+            DEBIAN_FRONTEND=noninteractive run_logged apt-get install -y "${packages[@]}"
             ;;
         apk)
-            apk update
-            apk add --no-cache "${packages[@]}"
+            run_logged apk update
+            run_logged apk add --no-cache "${packages[@]}"
             ;;
         dnf)
-            dnf install -y --allowerasing "${packages[@]}"
+            run_logged dnf install -y --allowerasing "${packages[@]}"
             ;;
         yum)
-            yum install -y "${packages[@]}"
+            run_logged yum install -y "${packages[@]}"
             ;;
         *)
             log_error "找不到可用包管理器"
@@ -279,9 +334,9 @@ download_file() {
     local url="$1"
     local output="$2"
     if command -v curl >/dev/null 2>&1; then
-        curl -fL --connect-timeout 20 --retry 2 -o "$output" "$url"
+        run_logged curl -fL --connect-timeout 20 --retry 2 -o "$output" "$url"
     elif command -v wget >/dev/null 2>&1; then
-        wget -O "$output" "$url"
+        run_logged wget -O "$output" "$url"
     else
         log_error "缺少 curl 或 wget"
         return 1
@@ -358,8 +413,28 @@ current_script_path() {
     esac
 }
 
-get_latest_toolkit_tag() {
-    get_latest_tag "phyrevue/tuu-toolkit" "v${TOOL_VERSION}"
+# 从脚本内容中解析 TOOL_VERSION
+toolkit_version_from_file() {
+    sed -n 's/^TOOL_VERSION="\([^"]*\)".*/\1/p' "$1" 2>/dev/null | head -n1
+}
+
+# 下载远程最新脚本到 $1，成功时输出其版本号。
+# 优先使用 main 分支（与 README 安装命令一致），失败时回退到最新 Release 附件。
+fetch_latest_toolkit() {
+    local output="$1"
+    local version="" tag=""
+
+    if download_file "$RAW_URL" "$output" >/dev/null 2>&1; then
+        version="$(toolkit_version_from_file "$output")"
+    fi
+    if [[ -z "$version" ]]; then
+        tag="$(get_latest_tag "phyrevue/tuu-toolkit" "")"
+        if [[ -n "$tag" ]] && download_file "${RELEASE_ASSET_URL_BASE}/${tag}/tuu-toolkit.sh" "$output" >/dev/null 2>&1; then
+            version="$(toolkit_version_from_file "$output")"
+        fi
+    fi
+    [[ -n "$version" ]] || return 1
+    echo "$version"
 }
 
 check_and_update_toolkit() {
@@ -367,35 +442,35 @@ check_and_update_toolkit() {
     init_context
     ensure_download_tool || return 1
 
-    local latest_tag latest_version download_url tmp_file target current_path
-    latest_tag="$(get_latest_toolkit_tag)"
-    latest_version="${latest_tag#v}"
+    local latest_version tmp_file target current_path
+    tmp_file="$(mktemp /tmp/tuu-toolkit-update.XXXXXX)"
 
     echo "当前版本: v${TOOL_VERSION}"
-    echo "最新版本: ${latest_tag}"
+    log_info "正在检查远程版本..."
+    if ! latest_version="$(fetch_latest_toolkit "$tmp_file")"; then
+        rm -f "$tmp_file"
+        log_error "无法获取远程版本信息，请检查网络或 GitHub 访问是否正常"
+        return 1
+    fi
+    echo "最新版本: v${latest_version}"
 
-    if ! version_gt "$latest_version" "$TOOL_VERSION"; then
+    if [[ "$latest_version" == "$TOOL_VERSION" ]]; then
+        rm -f "$tmp_file"
         log_success "当前已是最新版本"
+        return 0
+    fi
+    if version_gt "$TOOL_VERSION" "$latest_version"; then
+        rm -f "$tmp_file"
+        log_info "本地版本高于远程版本，无需更新"
         return 0
     fi
 
     echo
-    log_info "发现新版本 ${latest_tag}"
+    log_info "发现新版本 v${latest_version}"
     if ! confirm "是否立即更新 TUU Toolkit?"; then
+        rm -f "$tmp_file"
         log_info "已取消更新"
         return 0
-    fi
-
-    tmp_file="$(mktemp /tmp/tuu-toolkit-update.XXXXXX)"
-    download_url="${RELEASE_ASSET_URL_BASE}/${latest_tag}/tuu-toolkit.sh"
-    log_info "下载: $download_url"
-    if ! download_file "$download_url" "$tmp_file"; then
-        log_warn "Release 附件下载失败，尝试 main 分支脚本"
-        if ! download_file "$RAW_URL" "$tmp_file"; then
-            rm -f "$tmp_file"
-            log_error "更新脚本下载失败"
-            return 1
-        fi
     fi
 
     if ! bash -n "$tmp_file"; then
@@ -414,7 +489,7 @@ check_and_update_toolkit() {
     install -m 755 "$tmp_file" "$target"
     rm -f "$tmp_file"
 
-    log_success "TUU Toolkit 已更新到 ${latest_tag}"
+    log_success "TUU Toolkit 已更新到 v${latest_version}"
     echo "安装位置: $target"
     if [[ "$target" == "$TOOL_INSTALL_PATH" ]]; then
         echo "以后可直接运行: tuu-toolkit"
@@ -603,14 +678,24 @@ service_action() {
     local action="$2"
     if [[ "$SERVICE_MANAGER" == "systemd" ]]; then
         if systemd_is_running; then
-            systemctl "$action" "$service"
+            run_logged systemctl "$action" "$service"
         else
             log_warn "systemd 未运行，无法执行: systemctl $action $service"
             return 1
         fi
     elif [[ "$SERVICE_MANAGER" == "openrc" ]]; then
         if command -v rc-service >/dev/null 2>&1; then
-            rc-service "$service" "$action"
+            # command_background 模式下进程退出后 OpenRC 仍记录为 started(crashed)，
+            # 此时 start 会提示 "already been started" 而不真正启动，stop 也会失败。
+            # 进程不在运行时先 zap 清除状态，再按实际情况执行。
+            if [[ "$action" =~ ^(start|restart|stop)$ ]] && ! rc-service "$service" status >/dev/null 2>&1; then
+                rc-service "$service" zap >/dev/null 2>&1 || true
+                case "$action" in
+                    stop) return 0 ;;
+                    restart) action="start" ;;
+                esac
+            fi
+            run_logged rc-service "$service" "$action"
         else
             log_warn "OpenRC 不可用，无法执行: rc-service $service $action"
             return 1
@@ -656,14 +741,23 @@ service_is_running() {
 # 重启后稍等再检查，避免配置错误导致进程立即退出却仍提示成功
 # 返回: 0 运行中, 1 启动后退出, 2 当前环境无法管理服务
 restart_and_verify_service() {
+    action_and_verify_service "$1" restart "${2:-}"
+}
+
+start_and_verify_service() {
+    action_and_verify_service "$1" start "${2:-}"
+}
+
+action_and_verify_service() {
     local service="$1"
-    local error_log="${2:-}"
+    local action="$2"
+    local error_log="${3:-}"
     local log_lines_before=0
     if [[ -n "$error_log" && -f "$error_log" ]]; then
         log_lines_before="$(wc -l < "$error_log")"
     fi
-    if ! service_action "$service" restart; then
-        log_warn "服务未能自动重启，请在完整 init 环境中手动启动"
+    if ! service_action "$service" "$action"; then
+        log_warn "服务未能成功执行 ${action}，请检查上方输出或在完整 init 环境中手动启动"
         return 2
     fi
     sleep 2
@@ -672,11 +766,18 @@ restart_and_verify_service() {
     fi
 
     log_error "$service 启动后未能保持运行，最近日志:"
+    local recent=""
     if [[ "$SERVICE_MANAGER" == "systemd" ]] && command -v journalctl >/dev/null 2>&1; then
-        journalctl -u "$service" -n 20 --no-pager >&2 2>/dev/null || true
+        recent="$(journalctl -u "$service" -n 20 --no-pager 2>/dev/null || true)"
     elif [[ -n "$error_log" && -f "$error_log" ]]; then
         # 错误日志是追加写入的，只显示本次重启后新增的内容
-        tail -n "+$((log_lines_before + 1))" "$error_log" | tail -n 20 >&2
+        recent="$(tail -n "+$((log_lines_before + 1))" "$error_log" | tail -n 20)"
+    fi
+    if [[ -n "$recent" ]]; then
+        printf '%s\n' "$recent" >&2
+        printf '%s\n' "$recent" | sed 's/^/    | /' 2>/dev/null >> "$LOG_FILE" || true
+    else
+        echo "(没有新的错误输出，可运行「日志与排错 -> 生成排错报告」获取详细信息)" >&2
     fi
     return 1
 }
@@ -1359,9 +1460,30 @@ install_or_update_realm() {
     log_success "Realm ${tag} 安装/更新完成"
 }
 
+realm_has_endpoints() {
+    [[ -f "$REALM_CONFIG" ]] && grep -q '^\[\[endpoints\]\]' "$REALM_CONFIG"
+}
+
+# Realm 在没有任何 endpoints 时会立即退出，因此启动前先检查规则
+realm_start_service() {
+    local action="${1:-start}"
+    if [[ ! -x "$REALM_BIN" ]]; then
+        log_error "Realm 主程序不存在，请先安装"
+        return 1
+    fi
+    if ! realm_has_endpoints; then
+        log_warn "当前没有任何 Realm 转发规则，Realm 启动后会立即退出，请先添加转发规则"
+        service_action "$REALM_SERVICE" stop >/dev/null 2>&1 || true
+        return 1
+    fi
+    if action_and_verify_service "$REALM_SERVICE" "$action" /var/log/realm.err; then
+        log_success "Realm 服务运行中"
+    fi
+}
+
 realm_service_restart_if_ready() {
     if [[ -x "$REALM_BIN" ]]; then
-        service_action "$REALM_SERVICE" restart || log_warn "Realm 服务未能自动重启，请在完整 init 环境中手动启动"
+        realm_start_service restart || true
     fi
 }
 
@@ -1505,7 +1627,7 @@ manage_realm_cron() {
                 mkdir -p /etc/crontabs
                 touch /etc/crontabs/root
                 sed -i '/realm/d' /etc/crontabs/root
-                echo "0 $hour * * * rc-service realm restart" >> /etc/crontabs/root
+                echo "0 $hour * * * (rc-service realm status >/dev/null 2>&1 || rc-service realm zap); rc-service realm restart" >> /etc/crontabs/root
                 if command -v rc-update >/dev/null 2>&1; then
                     rc-update add crond default >/dev/null 2>&1 || true
                 fi
@@ -1534,6 +1656,7 @@ EOF
 }
 
 show_realm_logs() {
+    echo "提示: 如需完整的排错信息，请在主菜单选择「7) 日志与排错 -> 生成排错报告」"
     echo -e "\n${BLUE}===== Realm 标准日志 /var/log/realm.log =====${NC}"
     [[ -f /var/log/realm.log ]] && tail -n 50 /var/log/realm.log || echo "暂无日志"
     echo -e "\n${BLUE}===== Realm 错误日志 /var/log/realm.err =====${NC}"
@@ -1593,6 +1716,505 @@ show_realm_info() {
     fi
 }
 
+# ======================== 日志与排错 ========================
+
+log_session_start() {
+    rotate_log_file
+    log_to_file INFO "===== 会话开始: TUU Toolkit v${TOOL_VERSION} | ${OS_NAME:-unknown} | ${SERVICE_MANAGER} | ${LIBC_KIND} | ${ARCH_RAW} | 参数: ${*:-无} ====="
+}
+
+# 隐藏配置/输出中的密码和分享链接
+mask_secrets() {
+    sed -E \
+        -e 's/("password"[[:space:]]*:[[:space:]]*")([^"\\]|\\.)*"/\1******"/g' \
+        -e 's/^([[:space:]]*password:[[:space:]]*).*/\1"******"/' \
+        -e 's#ss://[^[:space:]]+#ss://******#g'
+}
+
+DIAG_ISSUES=()
+
+diag_issue() {
+    DIAG_ISSUES+=("$*")
+}
+
+diag_section() {
+    printf '\n==================== %s ====================\n' "$*"
+}
+
+# 打印并执行命令，最长 15 秒，输出合并 stderr
+diag_run() {
+    local rc
+    printf '$ %s\n' "$*"
+    if command -v timeout >/dev/null 2>&1; then
+        timeout 15 "$@" 2>&1
+    else
+        "$@" 2>&1
+    fi
+    rc=$?
+    (( rc != 0 )) && printf '(退出码: %s)\n' "$rc"
+    return 0
+}
+
+diag_tail() {
+    local file="$1"
+    local count="${2:-50}"
+    if [[ -f "$file" ]]; then
+        printf -- '--- %s (最后 %s 行, 修改时间: %s) ---\n' "$file" "$count" \
+            "$(date -r "$file" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo 未知)"
+        tail -n "$count" "$file" | mask_secrets
+    else
+        printf -- '--- %s: 不存在 ---\n' "$file"
+    fi
+}
+
+diag_listening_sockets() {
+    if command -v ss >/dev/null 2>&1; then
+        ss -lntup 2>/dev/null
+    elif command -v netstat >/dev/null 2>&1; then
+        netstat -lntup 2>/dev/null
+    fi
+}
+
+diag_port_listeners() {
+    diag_listening_sockets | grep -E "[:.]$1[[:space:]]" || true
+}
+
+diag_process_lines() {
+    local bin="$1"
+    ps -ef 2>/dev/null | grep -F "$bin" | grep -v grep || ps 2>/dev/null | grep -F "$bin" | grep -v grep || true
+}
+
+diag_check_service() {
+    local label="$1" service="$2" bin="$3" config="$4" out_log="$5" err_log="$6" version_flag="$7"
+    shift 7
+    local ports=("$@")
+    local unit_file status_out status_rc running=0 out port listeners
+
+    if [[ "$SERVICE_MANAGER" == "openrc" ]]; then
+        unit_file="/etc/init.d/$service"
+    else
+        unit_file="/etc/systemd/system/$service.service"
+    fi
+
+    diag_section "$label"
+    if [[ ! -e "$bin" && ! -f "$config" && ! -f "$unit_file" ]]; then
+        echo "未安装 (主程序、配置和服务文件都不存在)"
+        return 0
+    fi
+
+    echo "主程序: $bin"
+    if [[ ! -e "$bin" ]]; then
+        diag_issue "$label: 主程序不存在 $bin，请重新安装"
+    elif [[ ! -x "$bin" ]]; then
+        diag_issue "$label: 主程序没有执行权限 $bin"
+    else
+        ls -l "$bin" 2>&1
+        out="$(timeout 5 "$bin" "$version_flag" 2>&1)"
+        status_rc=$?
+        echo "版本检测 ($bin $version_flag, 退出码 $status_rc):"
+        printf '%s\n' "$out" | head -n 10
+        if (( status_rc != 0 )) && [[ "$status_rc" != "124" ]]; then
+            if grep -q 'GLIBC_[0-9]' <<< "$out"; then
+                diag_issue "$label: 主程序与系统 glibc 版本不兼容 ($(grep -o 'GLIBC_[0-9.]*' <<< "$out" | head -n1))，请用 musl 版本重新安装"
+            elif grep -qiE 'not found|no such file' <<< "$out"; then
+                diag_issue "$label: 主程序无法运行，可能是架构或 libc 不匹配: $(head -n1 <<< "$out")"
+            else
+                diag_issue "$label: 主程序版本检测失败 (退出码 $status_rc): $(head -n1 <<< "$out")"
+            fi
+        fi
+        if command -v ldd >/dev/null 2>&1; then
+            out="$(ldd "$bin" 2>&1 || true)"
+            if grep -q 'not found' <<< "$out"; then
+                diag_issue "$label: 缺少动态库: $(grep 'not found' <<< "$out" | awk '{print $1}' | tr '\n' ' ')"
+                printf '%s\n' "$out"
+            fi
+        fi
+    fi
+
+    echo
+    echo "配置文件: $config"
+    if [[ -f "$config" ]]; then
+        ls -l "$config" 2>&1
+        sed -n '1,200p' "$config" | mask_secrets
+    else
+        diag_issue "$label: 配置文件不存在 $config"
+    fi
+
+    echo
+    echo "服务文件: $unit_file"
+    if [[ -f "$unit_file" ]]; then
+        cat "$unit_file"
+    else
+        diag_issue "$label: 服务文件不存在 $unit_file，请重新安装以生成服务"
+    fi
+
+    echo
+    echo "服务状态:"
+    if [[ "$SERVICE_MANAGER" == "openrc" ]] && command -v rc-service >/dev/null 2>&1; then
+        status_out="$(rc-service "$service" status 2>&1)"
+        status_rc=$?
+        printf '%s\n(退出码: %s)\n' "$status_out" "$status_rc"
+        (( status_rc == 0 )) && running=1
+        if grep -qi 'crashed' <<< "$status_out"; then
+            diag_issue "$label: OpenRC 记录为 crashed，进程启动后已退出，请查看下方错误日志"
+        fi
+        if command -v rc-update >/dev/null 2>&1 && ! rc-update show default 2>/dev/null | grep -qw "$service"; then
+            diag_issue "$label: 未加入开机自启 (rc-update add $service default)"
+        fi
+    elif [[ "$SERVICE_MANAGER" == "systemd" ]] && systemd_is_running; then
+        diag_run systemctl status "$service" --no-pager -l -n 0
+        systemctl is-active --quiet "$service" && running=1
+        if [[ "$(systemctl is-enabled "$service" 2>/dev/null)" != "enabled" ]]; then
+            diag_issue "$label: 未设置开机自启 (systemctl enable $service)"
+        fi
+        if [[ "$(systemctl is-active "$service" 2>/dev/null)" == "failed" ]]; then
+            diag_issue "$label: systemd 显示服务启动失败 (failed)，请查看下方 journal 日志"
+        fi
+    else
+        echo "无法检测 (服务管理器不可用)"
+    fi
+    if (( running == 0 )); then
+        diag_issue "$label: 服务当前未运行"
+    fi
+
+    echo
+    echo "相关进程:"
+    out="$(diag_process_lines "$bin")"
+    echo "${out:-无}"
+
+    if [[ ${#ports[@]} -gt 0 ]]; then
+        echo
+        echo "端口监听:"
+        for port in "${ports[@]}"; do
+            [[ -z "$port" ]] && continue
+            listeners="$(diag_port_listeners "$port")"
+            if [[ -n "$listeners" ]]; then
+                echo "端口 $port:"
+                printf '%s\n' "$listeners"
+                if (( running == 0 )); then
+                    diag_issue "$label: 服务未运行但端口 $port 已被其他进程占用，可能导致启动失败"
+                fi
+            else
+                echo "端口 $port: 未监听"
+                (( running == 1 )) && diag_issue "$label: 服务在运行，但端口 $port 未处于监听状态"
+            fi
+        done
+    fi
+
+    echo
+    echo "日志:"
+    diag_tail "$err_log" 60
+    diag_tail "$out_log" 30
+    if [[ "$SERVICE_MANAGER" == "systemd" ]] && command -v journalctl >/dev/null 2>&1; then
+        echo "--- journalctl -u $service (最后 60 行) ---"
+        journalctl -u "$service" -n 60 --no-pager 2>&1 | mask_secrets
+    fi
+}
+
+diag_check_realm_endpoints() {
+    local listens=() remotes=() i host port target
+    [[ -f "$REALM_CONFIG" ]] || return 0
+    mapfile -t listens < <(sed -n 's/^[[:space:]]*listen[[:space:]]*=[[:space:]]*"\(.*\)".*/\1/p' "$REALM_CONFIG")
+    mapfile -t remotes < <(sed -n 's/^[[:space:]]*remote[[:space:]]*=[[:space:]]*"\(.*\)".*/\1/p' "$REALM_CONFIG")
+
+    diag_section "Realm 转发规则检测"
+    echo "规则数量: ${#listens[@]}"
+    if [[ ${#listens[@]} -eq 0 ]]; then
+        diag_issue "Realm: 配置中没有任何转发规则，Realm 启动后会立即退出"
+        return 0
+    fi
+    for ((i = 0; i < ${#listens[@]} && i < 30; i++)); do
+        target="${remotes[$i]:-}"
+        echo "规则 $((i + 1)): ${listens[$i]} -> ${target:-<缺少 remote>}"
+        if [[ -z "$target" ]]; then
+            diag_issue "Realm: 规则 $((i + 1)) 缺少 remote"
+            continue
+        fi
+        port="${target##*:}"
+        host="${target%:*}"
+        host="${host#[}"
+        host="${host%]}"
+        if timeout 3 bash -c "exec 3<>/dev/tcp/${host}/${port}" 2>/dev/null; then
+            echo "  目标 TCP 连通: 正常"
+        else
+            echo "  目标 TCP 连通: 失败"
+            diag_issue "Realm: 规则 $((i + 1)) 的目标 ${target} 从本机 TCP 连接失败 (目标未开放、被防火墙拦截或域名无法解析)"
+        fi
+    done
+}
+
+diag_system() {
+    local free_kb
+    diag_section "系统信息"
+    echo "TUU Toolkit: v${TOOL_VERSION}"
+    echo "脚本路径: $(readlink -f "${BASH_SOURCE[0]:-$0}" 2>/dev/null || echo "${BASH_SOURCE[0]:-$0}")"
+    echo "生成时间: $(date '+%Y-%m-%d %H:%M:%S %z')"
+    echo "系统: ${OS_NAME:-unknown} | 系统族: $OS_FAMILY | 包管理器: $PKG_MANAGER"
+    echo "服务管理: $SERVICE_MANAGER | libc: $LIBC_KIND | 架构: $ARCH_RAW"
+    echo "Bash: ${BASH_VERSION:-unknown}"
+    echo "PID 1: $(cat /proc/1/comm 2>/dev/null || echo unknown)"
+    if command -v systemd-detect-virt >/dev/null 2>&1; then
+        echo "虚拟化: $(systemd-detect-virt 2>/dev/null || echo none)"
+    elif [[ -f /.dockerenv ]] || grep -qaE 'docker|lxc|container' /proc/1/cgroup /proc/1/environ 2>/dev/null; then
+        echo "虚拟化: 可能运行在容器中"
+    fi
+    diag_run uname -a
+    diag_run uptime
+    if [[ "$LIBC_KIND" == "gnu" ]]; then
+        echo "glibc: $(ldd --version 2>&1 | head -n1)"
+    fi
+
+    diag_section "资源"
+    diag_run free -m
+    diag_run df -h /
+    echo "ulimit -n: $(ulimit -n)"
+    free_kb="$(df -Pk / 2>/dev/null | awk 'NR==2 {print $4}')"
+    if [[ -n "$free_kb" ]] && (( free_kb < 51200 )); then
+        diag_issue "系统: 根分区剩余空间不足 50MB，可能导致安装或日志写入失败"
+    fi
+
+    diag_section "服务管理器"
+    if [[ "$SERVICE_MANAGER" == "openrc" ]]; then
+        if ! command -v rc-service >/dev/null 2>&1; then
+            diag_issue "系统: 未安装 OpenRC (rc-service 不存在)"
+        fi
+        if [[ ! -f /run/openrc/softlevel ]]; then
+            diag_issue "系统: OpenRC 未初始化 (缺少 /run/openrc/softlevel)，服务无法启动；可执行 openrc default 或 mkdir -p /run/openrc && touch /run/openrc/softlevel"
+        fi
+        command -v rc-status >/dev/null 2>&1 && diag_run rc-status -a
+    elif [[ "$SERVICE_MANAGER" == "systemd" ]]; then
+        if ! systemd_is_running; then
+            diag_issue "系统: 当前系统没有运行 systemd (常见于容器)，服务无法通过 systemctl 管理"
+        else
+            diag_run systemctl --failed --no-pager
+        fi
+    else
+        diag_issue "系统: 未识别到可用的服务管理器"
+    fi
+
+    diag_section "网络"
+    diag_run cat /etc/resolv.conf
+    if command -v ip >/dev/null 2>&1; then
+        diag_run ip addr
+        diag_run ip route
+    fi
+    local host url code
+    for host in github.com api.github.com raw.githubusercontent.com; do
+        if getent hosts "$host" >/dev/null 2>&1 || nslookup "$host" >/dev/null 2>&1; then
+            echo "DNS 解析 $host: 正常"
+        else
+            echo "DNS 解析 $host: 失败"
+            diag_issue "网络: 无法解析 $host，安装和更新会失败，请检查 DNS"
+        fi
+    done
+    for url in https://api.github.com https://raw.githubusercontent.com; do
+        if command -v curl >/dev/null 2>&1; then
+            code="$(curl -sS -o /dev/null -w '%{http_code} 用时 %{time_total}s' --max-time 10 "$url" 2>&1)"
+            echo "访问 $url: $code"
+            if [[ "$code" == 000* || "$code" == curl:* ]]; then
+                diag_issue "网络: 无法访问 $url ($code)"
+            fi
+        elif command -v wget >/dev/null 2>&1; then
+            if timeout 10 wget -q --spider "$url" 2>/dev/null; then
+                echo "访问 $url: 正常"
+            else
+                echo "访问 $url: 失败"
+                diag_issue "网络: 无法访问 $url"
+            fi
+        fi
+    done
+
+    diag_section "监听端口"
+    local sockets
+    sockets="$(diag_listening_sockets)"
+    echo "${sockets:-无法获取 (缺少 ss/netstat)}"
+
+    diag_section "防火墙"
+    command -v iptables >/dev/null 2>&1 && diag_run iptables -S INPUT
+    command -v ip6tables >/dev/null 2>&1 && diag_run ip6tables -S INPUT
+    command -v nft >/dev/null 2>&1 && diag_run nft list ruleset
+    command -v ufw >/dev/null 2>&1 && diag_run ufw status
+    command -v firewall-cmd >/dev/null 2>&1 && diag_run firewall-cmd --list-all
+
+    diag_section "定时任务"
+    grep -hE 'realm|gost|ss-rust' /etc/crontabs/root /etc/cron.d/* /var/spool/cron/crontabs/root 2>/dev/null || echo "无相关定时任务"
+}
+
+generate_diagnostic_report() {
+    require_root
+    init_context
+    local ts report body gost_port ss_port realm_ports=() issue
+
+    mkdir -p "$DIAG_DIR"
+    chmod 700 "$DIAG_DIR" 2>/dev/null || true
+    ts="$(date '+%Y%m%d-%H%M%S')"
+    report="$DIAG_DIR/diagnose-${ts}.txt"
+    body="$(mktemp /tmp/tuu-diag.XXXXXX)"
+    DIAG_ISSUES=()
+
+    log_info "正在收集排错信息，网络检测可能需要几十秒..."
+
+    if [[ -f "$GOST_CONFIG" ]]; then
+        gost_port="$(sed -n 's/.*addr:[[:space:]]*"[^"]*:\([0-9][0-9]*\)".*/\1/p' "$GOST_CONFIG" | head -n1)"
+    fi
+    if [[ -f "$SS_CONFIG" ]]; then
+        ss_port="$(json_get_scalar "$SS_CONFIG" server_port)"
+    fi
+    if [[ -f "$REALM_CONFIG" ]]; then
+        mapfile -t realm_ports < <(sed -n 's/^[[:space:]]*listen[[:space:]]*=[[:space:]]*".*:\([0-9][0-9]*\)".*/\1/p' "$REALM_CONFIG")
+    fi
+
+    {
+        diag_system
+        diag_check_service "GOST SOCKS5" "$GOST_SERVICE" "$GOST_BIN" "$GOST_CONFIG" \
+            /var/log/gost/gost.log /var/log/gost/gost.err -V ${gost_port:+"$gost_port"}
+        diag_check_service "Shadowsocks Rust" "$SS_SERVICE" "$SS_BIN" "$SS_CONFIG" \
+            /var/log/ss-rust.log /var/log/ss-rust.err --version ${ss_port:+"$ss_port"}
+        diag_check_service "Realm" "$REALM_SERVICE" "$REALM_BIN" "$REALM_CONFIG" \
+            /var/log/realm.log /var/log/realm.err -v "${realm_ports[@]}"
+        diag_check_realm_endpoints
+        diag_section "脚本日志 $LOG_FILE (最后 150 行)"
+        diag_tail "$LOG_FILE" 150
+    } > "$body" 2>&1
+
+    {
+        echo "TUU Toolkit 排错报告"
+        echo "生成时间: $(date '+%Y-%m-%d %H:%M:%S %z')"
+        echo "说明: 密码和 ss:// 链接已脱敏，但报告中包含 IP 地址和端口，分享前请自行确认"
+        diag_section "问题摘要 (${#DIAG_ISSUES[@]} 项)"
+        if [[ ${#DIAG_ISSUES[@]} -eq 0 ]]; then
+            echo "未发现明显问题"
+        else
+            for issue in "${DIAG_ISSUES[@]}"; do
+                echo "- $issue"
+            done
+        fi
+        cat "$body"
+    } > "$report"
+    rm -f "$body"
+    chmod 600 "$report"
+
+    # 只保留最近 10 份报告
+    ls -1t "$DIAG_DIR"/diagnose-*.txt 2>/dev/null | tail -n +11 | xargs -r rm -f 2>/dev/null || true
+
+    write_log "生成排错报告: $report (发现 ${#DIAG_ISSUES[@]} 项问题)"
+    echo
+    echo -e "${YELLOW}问题摘要:${NC}"
+    if [[ ${#DIAG_ISSUES[@]} -eq 0 ]]; then
+        log_success "未发现明显问题"
+    else
+        for issue in "${DIAG_ISSUES[@]}"; do
+            echo -e "  ${RED}-${NC} $issue"
+        done
+    fi
+    echo
+    log_success "排错报告已保存: $report"
+    echo "反馈问题时请附上此文件 (密码已脱敏，含 IP 地址)。"
+}
+
+# 给日志中的 ERROR/WARN 上色
+colorize_log() {
+    sed -e "s/\[ERROR\]/$(printf '\033[0;31m')[ERROR]$(printf '\033[0m')/" \
+        -e "s/\[WARN\]/$(printf '\033[1;33m')[WARN]$(printf '\033[0m')/"
+}
+
+view_text() {
+    if [[ -t 1 ]] && command -v less >/dev/null 2>&1; then
+        less -R "$@"
+    else
+        cat "$@"
+    fi
+}
+
+show_toolkit_log() {
+    echo -e "${BLUE}===== 脚本日志 $LOG_FILE (最后 ${1:-100} 行) =====${NC}"
+    if [[ -f "$LOG_FILE" ]]; then
+        tail -n "${1:-100}" "$LOG_FILE" | colorize_log
+    else
+        echo "暂无脚本日志"
+    fi
+}
+
+show_toolkit_errors() {
+    echo -e "${BLUE}===== 最近的错误和警告 (含失败命令输出) =====${NC}"
+    if [[ ! -f "$LOG_FILE" ]]; then
+        echo "暂无脚本日志"
+        return 0
+    fi
+    local result
+    result="$(awk '
+        /\[(ERROR|WARN)\]/ { keep = 1; print; next }
+        /^    \|/ { if (keep) print; next }
+        { keep = 0 }
+    ' "$LOG_FILE" | tail -n 120)"
+    if [[ -z "$result" ]]; then
+        log_success "日志中没有错误或警告"
+    else
+        printf '%s\n' "$result" | colorize_log
+    fi
+}
+
+show_all_service_logs() {
+    local f
+    for f in /var/log/gost/gost.err /var/log/gost/gost.log /var/log/ss-rust.err /var/log/ss-rust.log /var/log/realm.err /var/log/realm.log; do
+        [[ -f "$f" ]] || continue
+        echo -e "\n${BLUE}===== $f (最后 30 行) =====${NC}"
+        tail -n 30 "$f" | mask_secrets
+    done
+    if [[ "$SERVICE_MANAGER" == "systemd" ]] && command -v journalctl >/dev/null 2>&1; then
+        local s
+        for s in "$GOST_SERVICE" "$SS_SERVICE" "$REALM_SERVICE"; do
+            [[ -f "/etc/systemd/system/$s.service" ]] || continue
+            echo -e "\n${BLUE}===== journalctl -u $s (最后 30 行) =====${NC}"
+            journalctl -u "$s" -n 30 --no-pager 2>&1 | mask_secrets
+        done
+    fi
+}
+
+show_latest_report() {
+    local latest
+    latest="$(ls -1t "$DIAG_DIR"/diagnose-*.txt 2>/dev/null | head -n1)"
+    if [[ -z "$latest" ]]; then
+        log_warn "还没有排错报告，请先生成"
+        return 0
+    fi
+    echo "报告: $latest"
+    view_text "$latest"
+}
+
+log_menu() {
+    while true; do
+        clear_screen
+        echo -e "${BOLD}TUU Toolkit - 日志与排错${NC}"
+        echo "脚本日志: $LOG_FILE"
+        echo "报告目录: $DIAG_DIR"
+        echo "1) 生成排错报告 (推荐，出问题时先运行这个)"
+        echo "2) 查看最近一次排错报告"
+        echo "3) 查看错误和警告"
+        echo "4) 查看脚本日志 (最近 100 行)"
+        echo "5) 查看所有服务日志"
+        echo "6) 清空脚本日志"
+        echo "0) 返回"
+        read -r -p "请选择: " choice
+        case "$choice" in
+            1) generate_diagnostic_report; pause ;;
+            2) show_latest_report; pause ;;
+            3) show_toolkit_errors; pause ;;
+            4) show_toolkit_log 100; pause ;;
+            5) show_all_service_logs; pause ;;
+            6)
+                if confirm "确认清空 $LOG_FILE?"; then
+                    : > "$LOG_FILE"
+                    log_success "脚本日志已清空"
+                fi
+                pause
+                ;;
+            0) return ;;
+            *) log_error "无效选项"; pause ;;
+        esac
+    done
+}
+
 gost_menu() {
     while true; do
         clear_screen
@@ -1608,9 +2230,9 @@ gost_menu() {
         read -r -p "请选择: " choice
         case "$choice" in
             1) install_or_update_gost; pause ;;
-            2) service_action "$GOST_SERVICE" start; pause ;;
+            2) start_and_verify_service "$GOST_SERVICE" /var/log/gost/gost.err; pause ;;
             3) service_action "$GOST_SERVICE" stop; pause ;;
-            4) service_action "$GOST_SERVICE" restart; pause ;;
+            4) restart_and_verify_service "$GOST_SERVICE" /var/log/gost/gost.err; pause ;;
             5) show_gost_info; pause ;;
             6) uninstall_gost; pause ;;
             0) return ;;
@@ -1634,9 +2256,9 @@ ss_menu() {
         read -r -p "请选择: " choice
         case "$choice" in
             1) install_or_update_ss; pause ;;
-            2) service_action "$SS_SERVICE" start; pause ;;
+            2) start_and_verify_service "$SS_SERVICE" /var/log/ss-rust.err; pause ;;
             3) service_action "$SS_SERVICE" stop; pause ;;
-            4) service_action "$SS_SERVICE" restart; pause ;;
+            4) restart_and_verify_service "$SS_SERVICE" /var/log/ss-rust.err; pause ;;
             5) show_ss_info; pause ;;
             6) uninstall_ss; pause ;;
             0) return ;;
@@ -1670,9 +2292,9 @@ realm_menu() {
             2) add_realm_rule; pause ;;
             3) show_realm_rules; pause ;;
             4) delete_realm_rule; pause ;;
-            5) service_action "$REALM_SERVICE" start; pause ;;
+            5) realm_start_service start; pause ;;
             6) service_action "$REALM_SERVICE" stop; pause ;;
-            7) service_action "$REALM_SERVICE" restart; pause ;;
+            7) realm_start_service restart; pause ;;
             8) manage_realm_cron; pause ;;
             9) show_realm_logs; pause ;;
             10) manual_test_realm; pause ;;
@@ -1688,6 +2310,7 @@ main_menu() {
     need_bash
     require_root
     init_context
+    log_session_start "菜单"
 
     while true; do
         clear_screen
@@ -1705,6 +2328,7 @@ main_menu() {
         echo "4) 系统检测"
         echo "5) 检测/更新脚本"
         echo "6) 安装基础依赖"
+        echo "7) 日志与排错"
         echo "0) 退出"
         echo -e "${YELLOW}========================================${NC}"
         read -r -p "请选择: " choice
@@ -1715,6 +2339,7 @@ main_menu() {
             4) print_system_info; pause ;;
             5) check_and_update_toolkit; pause ;;
             6) install_core_dependencies; pause ;;
+            7) log_menu ;;
             0) exit 0 ;;
             *) log_error "无效选项"; pause ;;
         esac
@@ -1732,7 +2357,22 @@ case "${1:-}" in
         ;;
     --update)
         need_bash
+        init_context
+        log_session_start "$@"
         check_and_update_toolkit
+        ;;
+    --diagnose)
+        need_bash
+        init_context
+        log_session_start "$@"
+        generate_diagnostic_report
+        ;;
+    --log)
+        need_bash
+        init_context
+        show_toolkit_errors
+        echo
+        show_toolkit_log 50
         ;;
     --help|-h)
         cat <<EOF
@@ -1743,12 +2383,15 @@ TUU Toolkit ${TOOL_VERSION}
   bash tuu-toolkit.sh
   bash tuu-toolkit.sh --check
   bash tuu-toolkit.sh --update
+  bash tuu-toolkit.sh --diagnose   生成排错报告 (保存到 ${DIAG_DIR})
+  bash tuu-toolkit.sh --log        查看脚本错误日志
 
 功能:
   - GOST SOCKS5 安装与服务管理
   - Shadowsocks Rust 安装与服务管理
   - Realm 安装、转发规则与服务管理
   - 检测并更新 TUU Toolkit 脚本
+  - 错误日志记录与一键排错报告
 
 支持:
   Debian/Ubuntu + systemd
