@@ -3,11 +3,11 @@
 # TUU Toolkit 一键管理脚本
 # 项目地址: https://github.com/phyrevue/tuu-toolkit
 # 支持: Debian/Ubuntu, Alpine, CentOS/RHEL/Rocky/Alma
-# Version: 2.0.6
+# Version: 2.0.7
 
 set -o pipefail
 
-TOOL_VERSION="2.0.6"
+TOOL_VERSION="2.0.7"
 REPO_URL="https://github.com/phyrevue/tuu-toolkit"
 RAW_URL="https://raw.githubusercontent.com/phyrevue/tuu-toolkit/main/tuu-toolkit.sh"
 RELEASE_ASSET_URL_BASE="https://github.com/phyrevue/tuu-toolkit/releases/download"
@@ -1142,9 +1142,14 @@ install_ss_binary() {
     log_success "Shadowsocks Rust v${version} 安装完成 (${selected_arch}): $SS_BIN"
 }
 
+# 内核禁用 IPv6 (ipv6.disable=1) 时 /proc/net/if_inet6 不存在，无法绑定 "::"
+ipv6_supported() {
+    [[ -e /proc/net/if_inet6 ]]
+}
+
 # 内核禁用 IPv6 时无法绑定 "::"，退回仅 IPv4 监听
 ss_listen_addr() {
-    if [[ -e /proc/net/if_inet6 ]]; then
+    if ipv6_supported; then
         echo "::"
     else
         echo "0.0.0.0"
@@ -1476,9 +1481,21 @@ realm_start_service() {
         service_action "$REALM_SERVICE" stop >/dev/null 2>&1 || true
         return 1
     fi
+    realm_fix_ipv6_listen
     if action_and_verify_service "$REALM_SERVICE" "$action" /var/log/realm.err; then
         log_success "Realm 服务运行中"
+    else
+        echo "可选择「10) 前台测试运行 Realm」直接查看报错，或在主菜单「7) 日志与排错」生成排错报告"
     fi
+}
+
+# 系统未启用 IPv6 时，"[::]" 监听会导致 Realm 绑定失败并立即退出，自动改为 0.0.0.0
+realm_fix_ipv6_listen() {
+    ipv6_supported && return 0
+    grep -qE '^[[:space:]]*listen[[:space:]]*=[[:space:]]*"\[::\]:' "$REALM_CONFIG" || return 0
+    cp -f "$REALM_CONFIG" "${REALM_CONFIG}.bak"
+    sed -i -E 's/^([[:space:]]*listen[[:space:]]*=[[:space:]]*")\[::\]:/\10.0.0.0:/' "$REALM_CONFIG"
+    log_warn "系统未启用 IPv6，已将 [::] 监听改为 0.0.0.0 (原配置备份: ${REALM_CONFIG}.bak)"
 }
 
 realm_service_restart_if_ready() {
@@ -1536,13 +1553,23 @@ add_realm_rule() {
     fi
     read -r -p "规则备注: " remark
 
+    local default_choice=1
     echo
+    if ! ipv6_supported; then
+        default_choice=2
+        log_warn "系统未启用 IPv6，无法使用双栈监听，默认使用仅 IPv4 监听"
+    fi
     echo "请选择监听模式:"
-    echo "1) 双栈监听 [::]:${local_port} (默认)"
-    echo "2) 仅 IPv4 监听 0.0.0.0:${local_port}"
+    echo "1) 双栈监听 [::]:${local_port}$( ((default_choice == 1)) && echo ' (默认)')"
+    echo "2) 仅 IPv4 监听 0.0.0.0:${local_port}$( ((default_choice == 2)) && echo ' (默认)')"
     echo "3) 自定义监听地址"
     read -r -p "选项 [1-3]: " ip_choice
-    case "${ip_choice:-1}" in
+    ip_choice="${ip_choice:-$default_choice}"
+    if [[ "$ip_choice" == "1" ]] && ! ipv6_supported; then
+        log_warn "系统未启用 IPv6，已改为仅 IPv4 监听 0.0.0.0:${local_port}"
+        ip_choice=2
+    fi
+    case "$ip_choice" in
         1) listen_addr="[::]:$local_port" ;;
         2) listen_addr="0.0.0.0:$local_port" ;;
         3)
@@ -1552,7 +1579,13 @@ add_realm_rule() {
                 return 1
             fi
             ;;
-        *) listen_addr="[::]:$local_port" ;;
+        *)
+            if ipv6_supported; then
+                listen_addr="[::]:$local_port"
+            else
+                listen_addr="0.0.0.0:$local_port"
+            fi
+            ;;
     esac
 
     cat >> "$REALM_CONFIG" <<EOF
@@ -1923,9 +1956,13 @@ diag_check_realm_endpoints() {
         diag_issue "Realm: 配置中没有任何转发规则，Realm 启动后会立即退出"
         return 0
     fi
+    echo "系统 IPv6: $(ipv6_supported && echo 已启用 || echo 未启用)"
     for ((i = 0; i < ${#listens[@]} && i < 30; i++)); do
         target="${remotes[$i]:-}"
         echo "规则 $((i + 1)): ${listens[$i]} -> ${target:-<缺少 remote>}"
+        if [[ "${listens[$i]}" == \[* ]] && ! ipv6_supported; then
+            diag_issue "Realm: 规则 $((i + 1)) 监听 IPv6 地址 ${listens[$i]}，但系统未启用 IPv6，Realm 会绑定失败退出 (新版脚本启动时会自动改为 0.0.0.0)"
+        fi
         if [[ -z "$target" ]]; then
             diag_issue "Realm: 规则 $((i + 1)) 缺少 remote"
             continue
@@ -2185,7 +2222,7 @@ show_latest_report() {
 log_menu() {
     while true; do
         clear_screen
-        echo -e "${BOLD}TUU Toolkit - 日志与排错${NC}"
+        echo -e "${BOLD}TUU Toolkit v${TOOL_VERSION} - 日志与排错${NC}"
         echo "脚本日志: $LOG_FILE"
         echo "报告目录: $DIAG_DIR"
         echo "1) 生成排错报告 (推荐，出问题时先运行这个)"
@@ -2218,7 +2255,7 @@ log_menu() {
 gost_menu() {
     while true; do
         clear_screen
-        echo -e "${BOLD}TUU Toolkit - GOST SOCKS5${NC}"
+        echo -e "${BOLD}TUU Toolkit v${TOOL_VERSION} - GOST SOCKS5${NC}"
         echo "状态: $(service_status_text "$GOST_SERVICE")"
         echo "1) 安装/更新 GOST SOCKS5"
         echo "2) 启动服务"
@@ -2244,7 +2281,7 @@ gost_menu() {
 ss_menu() {
     while true; do
         clear_screen
-        echo -e "${BOLD}TUU Toolkit - Shadowsocks Rust${NC}"
+        echo -e "${BOLD}TUU Toolkit v${TOOL_VERSION} - Shadowsocks Rust${NC}"
         echo "状态: $(service_status_text "$SS_SERVICE")"
         echo "1) 安装/更新 Shadowsocks Rust"
         echo "2) 启动服务"
@@ -2270,7 +2307,7 @@ ss_menu() {
 realm_menu() {
     while true; do
         clear_screen
-        echo -e "${BOLD}TUU Toolkit - Realm${NC}"
+        echo -e "${BOLD}TUU Toolkit v${TOOL_VERSION} - Realm${NC}"
         echo "状态: $(service_status_text "$REALM_SERVICE")"
         echo "配置目录: $REALM_DIR"
         echo "1) 安装/更新 Realm"
