@@ -3,11 +3,11 @@
 # TUU Toolkit 一键管理脚本
 # 项目地址: https://github.com/phyrevue/tuu-toolkit
 # 支持: Debian/Ubuntu, Alpine, CentOS/RHEL/Rocky/Alma
-# Version: 2.0.7
+# Version: 2.0.8
 
 set -o pipefail
 
-TOOL_VERSION="2.0.7"
+TOOL_VERSION="2.0.8"
 REPO_URL="https://github.com/phyrevue/tuu-toolkit"
 RAW_URL="https://raw.githubusercontent.com/phyrevue/tuu-toolkit/main/tuu-toolkit.sh"
 RELEASE_ASSET_URL_BASE="https://github.com/phyrevue/tuu-toolkit/releases/download"
@@ -543,6 +543,40 @@ linux_rust_target() {
             ;;
         *) echo "" ;;
     esac
+}
+
+# 检查二进制能否在当前系统运行: binary_runs 路径 版本参数 [错误输出文件]
+binary_runs() {
+    local bin="$1"
+    local flag="$2"
+    local err_file="${3:-/dev/null}"
+    if command -v timeout >/dev/null 2>&1; then
+        timeout 5 "$bin" "$flag" >/dev/null 2>"$err_file"
+    else
+        "$bin" "$flag" >/dev/null 2>"$err_file"
+    fi
+    local rc=$?
+    # 124 = 超时，说明程序已经跑起来了
+    [[ "$rc" == "0" || "$rc" == "124" ]]
+}
+
+# 解释二进制无法运行的原因，输出一行中文说明
+explain_binary_failure() {
+    local bin="$1"
+    local err_text="${2:-}"
+    if [[ ! -e "$bin" ]]; then
+        echo "主程序不存在: $bin"
+    elif grep -q 'GLIBC_[0-9]' <<< "$err_text"; then
+        echo "系统 glibc 版本过旧 (需要 $(grep -o 'GLIBC_[0-9.]*' <<< "$err_text" | sort -V | tail -n1))，需要改用静态 musl 构建"
+    elif grep -qi 'exec format error' <<< "$err_text"; then
+        echo "程序架构与系统不匹配 (当前架构 $ARCH_RAW)"
+    elif [[ "$LIBC_KIND" == "musl" ]] && grep -qa 'ld-linux' "$bin" 2>/dev/null; then
+        echo "这是 glibc 版本的程序，当前系统是 musl (Alpine)，缺少 glibc 动态加载器，所以提示 No such file or directory"
+    elif grep -qiE 'not found|no such file' <<< "$err_text"; then
+        echo "程序依赖的动态加载器或库不存在，可能是 libc 或架构不匹配"
+    else
+        echo "程序无法运行: $(head -n1 <<< "$err_text")"
+    fi
 }
 
 json_escape() {
@@ -1442,34 +1476,63 @@ install_or_update_realm() {
     require_root
     install_core_dependencies || return 1
     init_context
-    local tag version arch url tmp
+    local tag version url tmp candidate selected="" candidates=() musl_arch native_arch
     tag="$(get_latest_tag "zhboner/realm" "v2.9.4")"
     version="${tag#v}"
-    arch="$(realm_arch)"
-    if [[ -z "$arch" ]]; then
+
+    # 优先静态 musl 构建 (glibc/musl 系统都能运行)，失败再用本机 libc 构建
+    musl_arch="$(linux_rust_target musl)"
+    native_arch="$(realm_arch)"
+    [[ -n "$musl_arch" ]] && candidates+=("$musl_arch")
+    [[ -n "$native_arch" && "$native_arch" != "$musl_arch" ]] && candidates+=("$native_arch")
+    if [[ ${#candidates[@]} -eq 0 ]]; then
         log_error "Realm 不支持当前架构: $ARCH_RAW / $LIBC_KIND"
         return 1
     fi
-    url="https://github.com/zhboner/realm/releases/download/v${version}/realm-${arch}.tar.gz"
+
     tmp="$(mktemp -d /tmp/tuu-realm.XXXXXX)"
     mkdir -p "$REALM_DIR"
-    log_info "下载 Realm: $url"
-    if ! download_file "$url" "$tmp/realm.tar.gz"; then
+    for candidate in "${candidates[@]}"; do
+        rm -rf "${tmp:?}/"*
+        url="https://github.com/zhboner/realm/releases/download/v${version}/realm-${candidate}.tar.gz"
+        log_info "下载 Realm: $url"
+        if ! download_file "$url" "$tmp/realm.tar.gz"; then
+            log_warn "未找到 ${candidate} 发布包，尝试其他构建"
+            continue
+        fi
+        if ! tar -xzf "$tmp/realm.tar.gz" -C "$tmp" || [[ ! -f "$tmp/realm" ]]; then
+            log_warn "${candidate} 安装包解压失败或缺少 realm 主程序"
+            continue
+        fi
+        chmod +x "$tmp/realm"
+        if binary_runs "$tmp/realm" -v "$tmp/check.err"; then
+            selected="$candidate"
+            break
+        fi
+        log_warn "${candidate} 构建无法在当前系统运行: $(explain_binary_failure "$tmp/realm" "$(cat "$tmp/check.err" 2>/dev/null)")"
+    done
+
+    if [[ -z "$selected" ]]; then
         rm -rf "$tmp"
+        log_error "没有可在当前系统运行的 Realm 构建 ($ARCH_RAW / $LIBC_KIND)"
         return 1
     fi
-    tar -xzf "$tmp/realm.tar.gz" -C "$tmp"
-    if [[ ! -f "$tmp/realm" ]]; then
-        log_error "解压后未找到 realm 主程序"
-        rm -rf "$tmp"
+    # 先写临时文件再 mv，避免覆盖正在运行的程序时报 Text file busy
+    if ! install -m 755 "$tmp/realm" "${REALM_BIN}.new" || ! mv -f "${REALM_BIN}.new" "$REALM_BIN"; then
+        rm -rf "$tmp" "${REALM_BIN}.new"
+        log_error "无法安装 realm 到 $REALM_BIN"
         return 1
     fi
-    install -m 755 "$tmp/realm" "$REALM_BIN"
     rm -rf "$tmp"
     create_default_realm_config
     create_realm_service
-    write_log "Realm installed/updated ${tag}"
-    log_success "Realm ${tag} 安装/更新完成"
+    write_log "Realm installed/updated ${tag} (${selected})"
+    log_success "Realm ${tag} 安装/更新完成 (${selected})"
+
+    # 已有规则时重启，让新程序生效
+    if realm_has_endpoints; then
+        realm_start_service restart || true
+    fi
 }
 
 realm_has_endpoints() {
@@ -1488,6 +1551,20 @@ realm_start_service() {
         service_action "$REALM_SERVICE" stop >/dev/null 2>&1 || true
         return 1
     fi
+    local check_err
+    check_err="$(mktemp /tmp/tuu-realm-check.XXXXXX)"
+    if ! binary_runs "$REALM_BIN" -v "$check_err"; then
+        log_error "Realm 主程序无法在当前系统运行: $(explain_binary_failure "$REALM_BIN" "$(cat "$check_err")")"
+        sed -n '1,5p' "$check_err" | sed 's/^/    /' >&2
+        rm -f "$check_err"
+        if [[ -t 0 ]] && confirm "是否立即重新安装 Realm? (保留配置和转发规则)"; then
+            install_or_update_realm
+            return $?
+        fi
+        echo "可在 Realm 菜单选择「1) 安装/更新 Realm」重新安装"
+        return 1
+    fi
+    rm -f "$check_err"
     realm_fix_ipv6_listen
     if action_and_verify_service "$REALM_SERVICE" "$action" /var/log/realm.err; then
         log_success "Realm 服务运行中"
@@ -1854,13 +1931,14 @@ diag_check_service() {
         echo "版本检测 ($bin $version_flag, 退出码 $status_rc):"
         printf '%s\n' "$out" | head -n 10
         if (( status_rc != 0 )) && [[ "$status_rc" != "124" ]]; then
-            if grep -q 'GLIBC_[0-9]' <<< "$out"; then
-                diag_issue "$label: 主程序与系统 glibc 版本不兼容 ($(grep -o 'GLIBC_[0-9.]*' <<< "$out" | head -n1))，请用 musl 版本重新安装"
-            elif grep -qiE 'not found|no such file' <<< "$out"; then
-                diag_issue "$label: 主程序无法运行，可能是架构或 libc 不匹配: $(head -n1 <<< "$out")"
-            else
-                diag_issue "$label: 主程序版本检测失败 (退出码 $status_rc): $(head -n1 <<< "$out")"
-            fi
+            diag_issue "$label: $(explain_binary_failure "$bin" "$out")，请在对应菜单重新执行「安装/更新」"
+        fi
+        if grep -qa 'ld-linux' "$bin" 2>/dev/null; then
+            echo "构建类型: glibc 动态链接"
+        elif grep -qa 'ld-musl' "$bin" 2>/dev/null; then
+            echo "构建类型: musl 动态链接"
+        else
+            echo "构建类型: 静态链接"
         fi
         if command -v ldd >/dev/null 2>&1; then
             out="$(ldd "$bin" 2>&1 || true)"
